@@ -109,6 +109,7 @@ function startFakeExtensionHost() {
                     conversation_id: message.args?.conversationId || "conversation-test",
                     assistant_message_id: "assistant-test",
                     assistant_text: "stub assistant response",
+                    assistant_outputs: [{ type: "file", name: "result.txt", mime_type: "text/plain", size: 2, data_base64: "T0s=" }],
                     model: message.args?.model,
                     thinking_effort: message.args?.thinkingEffort,
                     max_runtime_seconds: message.args?.maxRuntimeSeconds,
@@ -362,7 +363,34 @@ try {
   assert.equal(host.seen.at(-1).args.maxRuntimeSeconds, 3300);
   assert.equal(host.seen.at(-1).args.continueInWork, true);
   assert.equal(host.seen.at(-1).args.projectId, chatgptProjectId);
+  assert.deepEqual(conversation.result.structuredContent.assistant_outputs, [{ type: "file", name: "result.txt", mime_type: "text/plain", size: 2, data_base64: "T0s=" }]);
   assert.deepEqual(new Set(host.seen.at(-1).allowedUrlPatterns), new Set(["http://*:*/*", "https://*:*/*"]));
+
+  const attachmentConversation = await bridgeTool(bridge, "chatgpt_conversation_start", {
+    prompt: "inspect the attached file",
+    attachments: [{
+      url: "https://files.example.test/problem.png",
+      name: "problem.png",
+      mime_type: "image/png",
+      size: 1234,
+    }],
+  });
+  assert.equal(attachmentConversation.result.isError, false, attachmentConversation.result.content[0].text);
+  assert.deepEqual(host.seen.at(-1).args.attachments, [{
+    url: "https://files.example.test/problem.png",
+    name: "problem.png",
+    mimeType: "image/png",
+    size: 1234,
+  }]);
+
+  const beforeInvalidAttachment = host.seen.length;
+  const invalidAttachment = await bridgeTool(bridge, "chatgpt_conversation_start", {
+    prompt: "invalid attachment",
+    attachments: [{ url: "http://files.example.test/problem.png", name: "problem.png" }],
+  });
+  assert.equal(invalidAttachment.result.isError, true);
+  assert.match(invalidAttachment.result.structuredContent.error, /must use HTTPS/);
+  assert.equal(host.seen.length, beforeInvalidAttachment, "invalid attachments must fail before browser dispatch");
 
   const continuation = await bridgeTool(bridge, "chatgpt_conversation_start", {
     prompt: "continue existing conversation",

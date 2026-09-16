@@ -741,7 +741,7 @@ const TOOLS = [
   {
     name: "chatgpt_conversation_start",
     title: "Start or continue an experimental ChatGPT browser conversation",
-    description: "Start a new ChatGPT conversation, or continue one exact existing conversation, through the signed-in page's first-party submitComposer runtime action without typing or clicking the UI and without foregrounding Chrome. Credentials and browser-generated proof material remain inside ChatGPT. The same bounded runtime also backs the separately selected experimental chatgpt-runtime browser models; it is never an automatic fallback.",
+    description: "Start a new ChatGPT conversation, or continue one exact existing conversation, through the signed-in page's first-party submitComposer runtime action without typing or clicking the UI and without foregrounding Chrome. Optional HTTPS-backed attachments are mounted through ChatGPT's native composer, and persisted assistant files/images are returned as structured outputs. Credentials and browser-generated proof material remain inside ChatGPT. The same bounded runtime also backs the separately selected experimental chatgpt-runtime browser models; it is never an automatic fallback.",
     inputSchema: {
       type: "object",
       properties: {
@@ -754,6 +754,15 @@ const TOOLS = [
         project_id: { type: "string", pattern: "^g-p-[A-Za-z0-9_-]{8,128}$", description: "Optional exact ChatGPT Project id. New runtime conversations are submitted only after the Project route and mounted composer state both match it." },
         conversation_id: { type: "string", pattern: "^[A-Za-z0-9_-]{8,128}$", description: "Optional exact existing ChatGPT conversation id. When supplied in runtime mode, MDB opens that conversation in an allocated background tab and continues it once." },
         tab_id: { type: "integer", minimum: 0, description: "Optional existing leased chatgpt.com Chrome tab id. When omitted, runtime mode leases and releases an MDB background tab automatically." },
+        attachments: {
+          type: "array", maxItems: 4, description: "Optional HTTPS-backed files to attach through ChatGPT's signed-in composer. The bridge fetches each URL and mounts the resulting bytes as native composer attachments.",
+          items: { type: "object", additionalProperties: false, required: ["url","name"], properties: {
+            url: { type: "string", minLength: 1, maxLength: 4000 },
+            name: { type: "string", minLength: 1, maxLength: 255 },
+            mime_type: { type: "string", maxLength: 200 },
+            size: { type: "integer", minimum: 0, maximum: 52428800 },
+          } },
+        },
       },
       required: ["prompt"],
       additionalProperties: false,
@@ -3110,7 +3119,7 @@ async function dispatchTool(name, args) {
         error.code = "CHATGPT_SECURITY_FIELDS_REFUSED";
         throw error;
       }
-      const allowed = new Set(["prompt", "transport", "model", "thinking_effort", "max_runtime_seconds", "continue_in_work", "project_id", "conversation_id", "tab_id"]);
+      const allowed = new Set(["prompt", "transport", "model", "thinking_effort", "max_runtime_seconds", "continue_in_work", "project_id", "conversation_id", "tab_id", "attachments"]);
       const unknown = keys.filter((key) => !allowed.has(key));
       if (unknown.length > 0) throw new Error(`Unknown chatgpt_conversation_start argument(s): ${unknown.join(", ")}`);
 
@@ -3155,6 +3164,23 @@ async function dispatchTool(name, args) {
       const tabId = args.tab_id === undefined || args.tab_id === null
         ? undefined
         : requireInteger(args, "tab_id", 0, 2_147_483_647);
+      const attachments = args.attachments === undefined ? [] : args.attachments;
+      if (!Array.isArray(attachments) || attachments.length > 4) throw new Error("'attachments' must be an array with at most 4 items");
+      let totalAttachmentBytes = 0;
+      const normalizedAttachments = attachments.map((item, index) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`attachments[${index}] must be an object`);
+        const url = String(item.url || "");
+        let parsed; try { parsed = new URL(url); } catch { throw new Error(`attachments[${index}].url must be a valid HTTPS URL`); }
+        if (parsed.protocol !== "https:") throw new Error(`attachments[${index}].url must use HTTPS`);
+        const name = String(item.name || "").trim();
+        if (!name || name.length > 255 || /[\/\\\0]/.test(name)) throw new Error(`attachments[${index}].name is invalid`);
+        const mimeType = item.mime_type == null ? "" : String(item.mime_type).slice(0, 200);
+        const size = item.size == null ? 0 : Number(item.size);
+        if (!Number.isInteger(size) || size < 0 || size > 52_428_800) throw new Error(`attachments[${index}].size is invalid`);
+        totalAttachmentBytes += size;
+        return { url, name, mimeType, size };
+      });
+      if (totalAttachmentBytes > 80 * 1024 * 1024) throw new Error("attachments total declared size exceeds 80 MB");
       return await callBackgroundChrome(name, "tabs.chatgptConversationStart", {
         prompt,
         transport,
@@ -3165,6 +3191,7 @@ async function dispatchTool(name, args) {
         ...(projectId === undefined ? {} : { projectId }),
         ...(conversationId === undefined ? {} : { conversationId }),
         ...(tabId === undefined ? {} : { tabId }),
+        ...(normalizedAttachments.length ? { attachments: normalizedAttachments } : {}),
       }, { timeoutMs: maxRuntimeSeconds * 1000 + 120_000 });
     }
 
