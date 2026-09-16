@@ -150,9 +150,10 @@ async function startBridge({ recheckMs = "400", providerEnv = {} } = {}) {
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
   };
-  await request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "federation-test", version: "1" }, capabilities: {} });
+  const initializeResponse = await request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "federation-test", version: "1" }, capabilities: {} });
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
   return {
+    initializeResponse,
     child,
     request,
     exited,
@@ -1063,7 +1064,14 @@ exec ${realPgrep} "$@"
     assert.equal(result.code, 0, `disable.sh must exit 0; output was:\n${result.out}`);
     assert.match(result.out, /child MCP server/i, `disable.sh must name what it reclaimed; output was:\n${result.out}`);
     let gone = false;
-    try { process.kill(-victim.pid, 0); } catch (error) { gone = error?.code === "ESRCH"; }
+    for (let attempt = 0; attempt < 10 && !gone; attempt += 1) {
+      try {
+        process.kill(-victim.pid, 0);
+      } catch (error) {
+        gone = error?.code === "ESRCH";
+      }
+      if (!gone) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     assert.equal(gone, true, `disable.sh reported success but process group ${victim.pid} is still alive`);
   }
 
@@ -1212,7 +1220,56 @@ exec ${realPgrep} "$@"
     assert.deepEqual(federation.listTools(), []);
   }
 
-  // --- 27. killNow reports containment honestly, and names survivors ------
+  // --- 27. child resources and UI metadata survive federation -------------
+  {
+    const federation = await makeFederation([stubProvider({ env: { STUB_RESOURCES: "1" } })]);
+    const tool = federation.listTools().find((candidate) => candidate.name === "stub__echo");
+    assert.ok(tool, "the resource-backed child tool must be advertised");
+    const proxiedUri = tool?._meta?.ui?.resourceUri;
+    assert.ok(typeof proxiedUri === "string" && proxiedUri.startsWith("ui://stub/"), `UI resource URI must be provider-namespaced: ${proxiedUri}`);
+    assert.equal(tool._meta["openai/outputTemplate"], proxiedUri, "compatibility outputTemplate must point at the same proxied resource");
+
+    const resources = federation.listResources();
+    assert.equal(resources.length, 1);
+    assert.equal(resources[0].uri, proxiedUri);
+    assert.equal(resources[0].mimeType, "text/html;profile=mcp-app");
+    assert.equal(federation.hasResource(proxiedUri), true);
+
+    const read = await federation.readResource(proxiedUri);
+    assert.equal(read.contents.length, 1);
+    assert.equal(read.contents[0].uri, proxiedUri, "resources/read must not leak the child's unprefixed URI back to the host");
+    assert.equal(read.contents[0].mimeType, "text/html;profile=mcp-app");
+    assert.match(read.contents[0].text, /stub widget/);
+  }
+
+  // --- 28. the bridge exposes federated resources to its MCP client --------
+  {
+    const bridge = await startBridge({ providerEnv: { STUB_RESOURCES: "1" } });
+    assert.deepEqual(
+      bridge.initializeResponse.result.capabilities.resources,
+      { listChanged: false, subscribe: false },
+      "the parent bridge must advertise resource support",
+    );
+
+    const toolList = await bridge.request("tools/list", {});
+    const tool = toolList.result.tools.find((candidate) => candidate.name === "stub__echo");
+    assert.ok(tool, "stub__echo must reach the bridge client");
+    const proxiedUri = tool?._meta?.ui?.resourceUri;
+    assert.ok(typeof proxiedUri === "string" && proxiedUri.startsWith("ui://stub/"));
+    assert.equal(tool._meta["openai/outputTemplate"], proxiedUri);
+
+    const resourceList = await bridge.request("resources/list", {});
+    assert.equal(resourceList.result.resources.length, 1);
+    assert.equal(resourceList.result.resources[0].uri, proxiedUri);
+
+    const resourceRead = await bridge.request("resources/read", { uri: proxiedUri });
+    assert.equal(resourceRead.result.contents.length, 1);
+    assert.equal(resourceRead.result.contents[0].uri, proxiedUri);
+    assert.equal(resourceRead.result.contents[0].mimeType, "text/html;profile=mcp-app");
+    assert.match(resourceRead.result.contents[0].text, /stub widget/);
+  }
+
+  // --- 29. killNow reports containment honestly, and names survivors ------
   {
     // A clean kill. Before the bounded retry this was false every single time:
     // the verdict was read one line after the SIGKILL, from
