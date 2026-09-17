@@ -13,7 +13,7 @@ const functionSource = `(async function pageChatgptRuntimeConversationStart(inpu
 assert.match(functionSource, /observedResponseSettled/);
 assert.doesNotMatch(functionSource, /Promise\.race\(\[observedResponse/);
 
-const persistedMatch = workerSource.match(/async function pageChatgptPersistedAssistantRead\(input\) \{([\s\S]*?)\n\}\n\nasync function pageChatgptRuntimeConversationStart/);
+const persistedMatch = workerSource.match(/async function pageChatgptPersistedAssistantRead\(input\) \{([\s\S]*?)\n\}\n\nasync function verifyChatgptPreservedRuntimeHandoff/);
 assert.ok(persistedMatch, "runtime completion must verify the persisted conversation message");
 const persistedFunctionSource = `(async function pageChatgptPersistedAssistantRead(input) {${persistedMatch[1]}\n})`;
 

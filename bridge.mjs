@@ -464,7 +464,14 @@ function auditSafeArguments(tool, args) {
   if (tool === "chatgpt_conversation_start" && typeof args?.prompt === "string") {
     const bytes = Buffer.byteLength(args.prompt, "utf8");
     const digest = crypto.createHash("sha256").update(args.prompt, "utf8").digest("hex").slice(0, 16);
-    return { ...args, prompt: `[REDACTED ${bytes} bytes sha256:${digest}]` };
+    const result = { ...args, prompt: `[REDACTED ${bytes} bytes sha256:${digest}]` };
+    const auditBootstrapKey = typeof args.bootstrap_prompt === "string" ? "bootstrap_prompt" : "bootstrapPrompt";
+    if (typeof args[auditBootstrapKey] === "string") {
+      const bootstrapBytes = Buffer.byteLength(args[auditBootstrapKey], "utf8");
+      const bootstrapDigest = crypto.createHash("sha256").update(args[auditBootstrapKey], "utf8").digest("hex").slice(0, 16);
+      result[auditBootstrapKey] = `[REDACTED ${bootstrapBytes} bytes sha256:${bootstrapDigest}]`;
+    }
+    return result;
   }
   return args;
 }
@@ -752,8 +759,10 @@ const TOOLS = [
         max_runtime_seconds: { type: "integer", minimum: 30, maximum: 3600, default: 600, description: "Maximum time to wait for this ChatGPT turn, including MDB tool use. Long-running agents may request up to one hour." },
         continue_in_work: { type: "boolean", default: true, description: "Raw diagnostic mode only: advertise ChatGPT's local.continue_in_work function to the private request." },
         project_id: { type: "string", pattern: "^g-p-[A-Za-z0-9_-]{8,128}$", description: "Optional exact ChatGPT Project id. New runtime conversations are submitted only after the Project route and mounted composer state both match it." },
+        bootstrap_prompt: { type: "string", minLength: 1, maxLength: 4000000, description: "Runtime-only first-turn prompt submitted only when the exact supplied tab is on the exact Project home/new-thread state. Otherwise prompt is submitted. Requires exact project_id and tab_id. Audit logs retain only byte length and a hash prefix." },
         conversation_id: { type: "string", pattern: "^[A-Za-z0-9_-]{8,128}$", description: "Optional exact existing ChatGPT conversation id. When supplied in runtime mode, MDB opens that conversation in an allocated background tab and continues it once." },
         tab_id: { type: "integer", minimum: 0, description: "Optional existing leased chatgpt.com Chrome tab id. When omitted, runtime mode leases and releases an MDB background tab automatically." },
+        preserve_tab: { type: "boolean", default: false, description: "Runtime-only ownership of an exact supplied tab. The tab must already be on the exact Project home or a conversation within that Project; verification uses the mounted page without reloading it. Requires exact project_id and tab_id." },
       },
       required: ["prompt"],
       additionalProperties: false,
@@ -3110,13 +3119,18 @@ async function dispatchTool(name, args) {
         error.code = "CHATGPT_SECURITY_FIELDS_REFUSED";
         throw error;
       }
-      const allowed = new Set(["prompt", "transport", "model", "thinking_effort", "max_runtime_seconds", "continue_in_work", "project_id", "conversation_id", "tab_id"]);
+      const allowed = new Set(["prompt", "transport", "model", "thinking_effort", "max_runtime_seconds", "continue_in_work", "project_id", "conversation_id", "tab_id", "bootstrap_prompt", "preserve_tab"]);
       const unknown = keys.filter((key) => !allowed.has(key));
       if (unknown.length > 0) throw new Error(`Unknown chatgpt_conversation_start argument(s): ${unknown.join(", ")}`);
 
       const prompt = requireString(args, "prompt");
       const promptBytes = Buffer.byteLength(prompt, "utf8");
       if (promptBytes > 4_000_000) throw new Error("'prompt' must be at most 4000000 UTF-8 bytes");
+      const bootstrapPrompt = args.bootstrap_prompt === undefined || args.bootstrap_prompt === null
+        ? undefined
+        : requireString(args, "bootstrap_prompt");
+      const bootstrapPromptBytes = bootstrapPrompt === undefined ? 0 : Buffer.byteLength(bootstrapPrompt, "utf8");
+      if (bootstrapPromptBytes > 4_000_000) throw new Error("'bootstrap_prompt' must be at most 4000000 UTF-8 bytes");
       const transport = optionalString(args, "transport", "runtime");
       if (!["runtime", "raw"].includes(transport)) {
         const error = new Error("'transport' must be runtime or raw");
@@ -3155,6 +3169,17 @@ async function dispatchTool(name, args) {
       const tabId = args.tab_id === undefined || args.tab_id === null
         ? undefined
         : requireInteger(args, "tab_id", 0, 2_147_483_647);
+      const preserveTab = optionalBoolean(args, "preserve_tab", false);
+      if (transport === "raw" && (bootstrapPrompt !== undefined || preserveTab)) {
+        const error = new Error("'bootstrap_prompt' and 'preserve_tab' are supported only by the runtime transport");
+        error.code = "CHATGPT_RUNTIME_OPTION_TRANSPORT_INVALID";
+        throw error;
+      }
+      if ((bootstrapPrompt !== undefined || preserveTab) && (projectId === undefined || tabId === undefined)) {
+        const error = new Error("'bootstrap_prompt' and 'preserve_tab' require exact 'project_id' and 'tab_id'");
+        error.code = "CHATGPT_RUNTIME_TAB_CONTEXT_REQUIRED";
+        throw error;
+      }
       return await callBackgroundChrome(name, "tabs.chatgptConversationStart", {
         prompt,
         transport,
@@ -3165,6 +3190,8 @@ async function dispatchTool(name, args) {
         ...(projectId === undefined ? {} : { projectId }),
         ...(conversationId === undefined ? {} : { conversationId }),
         ...(tabId === undefined ? {} : { tabId }),
+        ...(bootstrapPrompt === undefined ? {} : { bootstrapPrompt }),
+        preserveTab,
       }, { timeoutMs: maxRuntimeSeconds * 1000 + 120_000 });
     }
 

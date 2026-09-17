@@ -362,7 +362,19 @@ try {
   assert.equal(host.seen.at(-1).args.maxRuntimeSeconds, 3300);
   assert.equal(host.seen.at(-1).args.continueInWork, true);
   assert.equal(host.seen.at(-1).args.projectId, chatgptProjectId);
+  assert.equal(host.seen.at(-1).args.preserveTab, false);
   assert.deepEqual(new Set(host.seen.at(-1).allowedUrlPatterns), new Set(["http://*:*/*", "https://*:*/*"]));
+
+  const sensitiveBootstrapPrompt = "browser bootstrap memory must also never reach the audit log";
+  const bootstrap = await bridgeTool(bridge, "chatgpt_conversation_start", {
+    prompt: sensitivePrompt,
+    bootstrap_prompt: sensitiveBootstrapPrompt,
+    project_id: chatgptProjectId,
+    tab_id: 42,
+  });
+  assert.equal(bootstrap.result.isError, false, bootstrap.result.content[0].text);
+  assert.equal(host.seen.at(-1).args.bootstrapPrompt, sensitiveBootstrapPrompt);
+  assert.equal(host.seen.at(-1).args.tabId, 42);
 
   const continuation = await bridgeTool(bridge, "chatgpt_conversation_start", {
     prompt: "continue existing conversation",
@@ -373,6 +385,7 @@ try {
   assert.equal(host.seen.at(-1).args.conversationId, "conversation-test");
   const auditText = await fs.readFile(auditFile, "utf8");
   assert.ok(!auditText.includes(sensitivePrompt), "conversation prompt leaked into the audit log");
+  assert.ok(!auditText.includes(sensitiveBootstrapPrompt), "bootstrap prompt leaked into the audit log");
   assert.match(auditText, /REDACTED \d+ bytes sha256:[0-9a-f]{16}/);
 
   const rawConversation = await bridgeTool(bridge, "chatgpt_conversation_start", {

@@ -1966,6 +1966,44 @@ async function pageChatgptPersistedAssistantRead(input) {
   );
 }
 
+async function verifyChatgptPreservedRuntimeHandoff(result, executeInTabFn, tabId) {
+  const expectedAssistantMessageId = result?.assistant_message_id == null ? null : String(result.assistant_message_id);
+  const expectedAssistantText = result?.assistant_text == null ? null : String(result.assistant_text);
+  if (!expectedAssistantMessageId || !expectedAssistantText) {
+    const error = new Error("The completed runtime result lacks the exact assistant identity required for preserve-tab verification.");
+    error.code = "CHATGPT_CONVERSATION_HANDOFF_UNCERTAIN";
+    throw error;
+  }
+  const persisted = await executeInTabFn(tabId, pageChatgptPersistedAssistantRead, [{
+    conversationId: result.conversation_id,
+    assistantMessageId: expectedAssistantMessageId,
+    timeoutMs: 15_000,
+  }], "MAIN");
+  if (persisted?.ok === false) {
+    const error = new Error(persisted.error?.message || "ChatGPT preserved-tab conversation verification failed.");
+    error.code = persisted.error?.code || "CHATGPT_CONVERSATION_HANDOFF_UNCERTAIN";
+    error.details = persisted.error || null;
+    throw error;
+  }
+  if (persisted?.assistant_message_id !== expectedAssistantMessageId || persisted?.assistant_text !== expectedAssistantText) {
+    const error = new Error("The mounted ChatGPT assistant message does not exactly match the completed runtime result.");
+    error.code = "CHATGPT_PRESERVED_TAB_HANDOFF_MISMATCH";
+    error.details = {
+      conversation_id: result.conversation_id,
+      expected_assistant_message_id: expectedAssistantMessageId,
+      observed_assistant_message_id: persisted?.assistant_message_id || null,
+    };
+    throw error;
+  }
+  return {
+    ...result,
+    assistant_message_id: persisted.assistant_message_id,
+    assistant_text: persisted.assistant_text,
+    persisted_response_bytes: persisted.persisted_response_bytes,
+    observation_source: "mounted-conversation-preserved",
+  };
+}
+
 async function pageChatgptRuntimeConversationStart(input) {
   const MAX_PROMPT_BYTES = 4_000_000;
   const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -1975,18 +2013,24 @@ async function pageChatgptRuntimeConversationStart(input) {
   const REQUEST_TIMEOUT_MS = maxRuntimeSeconds * 1000;
   const RUNTIME_READY_TIMEOUT_MS = 20_000;
   const fail = (code, message, details = {}) => ({ ok: false, error: { code, message, ...details } });
-  const prompt = String(input?.prompt || "");
+  let prompt = String(input?.prompt || "");
   const model = String(input?.model || "gpt-5-6-pro");
   const thinkingEffort = String(input?.thinkingEffort || "standard");
   const projectId = input?.projectId == null ? null : String(input.projectId);
   const expectedConversationId = input?.conversationId == null ? null : String(input.conversationId);
-  const promptBytes = new TextEncoder().encode(prompt).length;
+  const bootstrapPrompt = input?.bootstrapPrompt == null ? null : String(input.bootstrapPrompt);
+  const preserveTab = input?.preserveTab === true;
+  const bootstrapPromptBytes = bootstrapPrompt === null ? 0 : new TextEncoder().encode(bootstrapPrompt).length;
+  let promptBytes = new TextEncoder().encode(prompt).length;
 
   if (location.origin !== "https://chatgpt.com") {
     return fail("CHATGPT_TAB_UNAVAILABLE", "The selected tab is not a chatgpt.com page.");
   }
   if (!prompt || promptBytes > MAX_PROMPT_BYTES) {
     return fail("CHATGPT_PROMPT_INVALID", `The prompt must be between 1 and ${MAX_PROMPT_BYTES} UTF-8 bytes.`);
+  }
+  if (bootstrapPrompt !== null && (!bootstrapPrompt || bootstrapPromptBytes > MAX_PROMPT_BYTES)) {
+    return fail("CHATGPT_BOOTSTRAP_PROMPT_INVALID", `The bootstrap prompt must be between 1 and ${MAX_PROMPT_BYTES} UTF-8 bytes.`);
   }
   if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(model)) {
     return fail("CHATGPT_MODEL_INVALID", "The model id contains unsupported characters.");
@@ -1999,6 +2043,17 @@ async function pageChatgptRuntimeConversationStart(input) {
   }
   if (expectedConversationId !== null && !/^[A-Za-z0-9_-]{8,128}$/.test(expectedConversationId)) {
     return fail("CHATGPT_CONVERSATION_ID_INVALID", "The existing ChatGPT conversation id is invalid.");
+  }
+  const projectHomePath = projectId === null ? null : `/g/${projectId}/project`;
+  const projectConversationPrefix = projectId === null ? null : `/g/${projectId}-coding-sessions/c/`;
+  const isExactProjectRoute = projectId !== null
+    && (location.pathname === projectHomePath || location.pathname.startsWith(projectConversationPrefix));
+  if (preserveTab && !isExactProjectRoute) {
+    return fail(
+      "CHATGPT_RUNTIME_TAB_PROJECT_MISMATCH",
+      "Preserve-tab requires the exact supplied tab to already be on the exact Project home or a conversation within that Project. No navigation was attempted.",
+      { requested_project_id: projectId },
+    );
   }
   if (model === "gpt-5-6-thinking") {
     const activeThinkingEffort = new URL(location.href).searchParams.get("thinking_effort");
@@ -2075,7 +2130,7 @@ async function pageChatgptRuntimeConversationStart(input) {
       { requested_model: model, active_model: currentModelId },
     );
   }
-  if (projectId !== null && expectedConversationId === null && location.pathname !== `/g/${projectId}/project`) {
+  if (projectId !== null && expectedConversationId === null && !preserveTab && location.pathname !== `/g/${projectId}/project`) {
     return fail(
       "CHATGPT_RUNTIME_PROJECT_MISMATCH",
       "The loaded ChatGPT page does not match the configured Project. No submission was attempted.",
@@ -2085,7 +2140,7 @@ async function pageChatgptRuntimeConversationStart(input) {
     || location.pathname.match(/^\/g\/[^/]+\/c\/([^/?#]+)/);
   const currentConversationId = currentConversationMatch?.[1] || null;
   if (expectedConversationId === null) {
-    if (modelContext.props.isNewThread !== true || currentConversationId !== null) {
+    if (!preserveTab && (modelContext.props.isNewThread !== true || currentConversationId !== null)) {
       return fail("CHATGPT_RUNTIME_NOT_NEW_THREAD", "Runtime-native start requires a fresh ChatGPT thread. No submission was attempted.");
     }
   } else {
@@ -2163,7 +2218,8 @@ async function pageChatgptRuntimeConversationStart(input) {
     );
   }
   const submitCandidate = submitCandidates[0];
-  if (Boolean(submitCandidate.sharedProps.isNewThread) !== (expectedConversationId === null)) {
+  if (!(preserveTab && expectedConversationId === null)
+    && Boolean(submitCandidate.sharedProps.isNewThread) !== (expectedConversationId === null)) {
     return fail("CHATGPT_RUNTIME_CONVERSATION_MISMATCH", "ChatGPT's shared composer state does not match the requested conversation mode. No submission was attempted.");
   }
   if (submitCandidate.sharedProps.isComposerSubmissionReady !== true || submitCandidate.sharedProps.isDisabled === true) {
@@ -2182,6 +2238,14 @@ async function pageChatgptRuntimeConversationStart(input) {
       );
     }
   }
+  if (bootstrapPrompt !== null
+    && expectedConversationId === null
+    && projectId !== null
+    && location.pathname === projectHomePath
+    && submitCandidate.sharedProps.isNewThread === true) {
+    prompt = bootstrapPrompt;
+    promptBytes = bootstrapPromptBytes;
+  }
   let submitSource = "";
   try { submitSource = Function.prototype.toString.call(submitCandidate.submitComposer); } catch {}
   const fingerprintMaterial = `${Object.keys(submitCandidate.sharedProps).sort().join("\n")}\n${submitSource}`;
@@ -2198,10 +2262,12 @@ async function pageChatgptRuntimeConversationStart(input) {
     model: currentModelId,
     thinking_effort: thinkingEffort,
     ...(projectId === null ? {} : { project_id: projectId }),
+    bootstrap_selected: Boolean(bootstrapPrompt !== null && prompt !== String(input?.prompt || "")),
+    preserve_tab: preserveTab,
     max_runtime_seconds: maxRuntimeSeconds,
     prompt_bytes: promptBytes,
     page_url: location.href,
-    operation: expectedConversationId === null ? "start" : "continue",
+    operation: expectedConversationId === null && !(preserveTab && currentConversationId) ? "start" : "continue",
   });
 
   const parseResponse = async (response) => {
@@ -3401,6 +3467,18 @@ async function dispatch(message) {
         error.code = "CHATGPT_CONTINUATION_TRANSPORT_INVALID";
         throw error;
       }
+      const bootstrapPrompt = args.bootstrapPrompt == null ? null : String(args.bootstrapPrompt);
+      const preserveTab = args.preserveTab === true;
+      if (transport !== "runtime" && (bootstrapPrompt !== null || preserveTab)) {
+        const error = new Error("Runtime-only options require the runtime transport.");
+        error.code = "CHATGPT_RUNTIME_OPTION_TRANSPORT_INVALID";
+        throw error;
+      }
+      if ((bootstrapPrompt !== null || preserveTab) && (projectId === null || args.tabId === undefined || args.tabId === null)) {
+        const error = new Error("Runtime-only tab options require an exact Project id and tab id.");
+        error.code = "CHATGPT_RUNTIME_TAB_CONTEXT_REQUIRED";
+        throw error;
+      }
       let tab;
       let autoLeased = false;
       if (args.tabId !== undefined && args.tabId !== null) {
@@ -3447,6 +3525,8 @@ async function dispatch(message) {
           continueInWork: args.continueInWork !== false,
           ...(projectId === null ? {} : { projectId }),
           ...(conversationId === null ? {} : { conversationId }),
+          ...(bootstrapPrompt === null ? {} : { bootstrapPrompt }),
+          preserveTab,
         }];
         const modelReadyDeadline = Date.now() + 20_000;
         let result;
@@ -3465,7 +3545,9 @@ async function dispatch(message) {
           error.details = result.error || null;
           throw error;
         }
-        if (transport === "runtime" && result?.complete === true && result?.conversation_id) {
+        if (preserveTab && result?.complete === true && result?.conversation_id) {
+          result = await verifyChatgptPreservedRuntimeHandoff(result, executeInTab, tab.id);
+        } else if (transport === "runtime" && result?.complete === true && result?.conversation_id) {
           const conversationUrl = String(result.page_url || (await readTab(tab.id))?.url || tab.url || "");
           await chrome.tabs.reload(tab.id);
           await new Promise((resolve) => setTimeout(resolve, 250));
