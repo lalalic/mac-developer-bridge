@@ -73,15 +73,22 @@ struct Paths {
     static var frontEnd: String { packageDir + "/mcp-http.mjs" }
 
     static let dataDir: String = {
+        if let explicit = ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_DATA_DIR"], !explicit.isEmpty {
+            return explicit
+        }
+        let skillState = ((packageDir as NSString).deletingLastPathComponent as NSString).appendingPathComponent(".state")
+        if FileManager.default.fileExists(atPath: skillState + "/config.env") { return skillState }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_DATA_DIR"]
-            ?? home + "/Library/Application Support/MacDeveloperBridge"
+        return home + "/Library/Application Support/MacDeveloperBridge"
     }()
 
     static let logDir: String = {
+        if let explicit = ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_LOG_DIR"], !explicit.isEmpty {
+            return explicit
+        }
+        if FileManager.default.fileExists(atPath: dataDir + "/config.env") { return dataDir + "/logs" }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_LOG_DIR"]
-            ?? home + "/Library/Logs/MacDeveloperBridge"
+        return home + "/Library/Logs/MacDeveloperBridge"
     }()
 
     static var tokenFile: String { dataDir + "/http-token" }
@@ -91,6 +98,31 @@ struct Paths {
     static var settingsFile: String { dataDir + "/settings.json" }
     static var httpLog: String { logDir + "/http.stderr.log" }
     static var tunnelLog: String { logDir + "/tunnel.stderr.log" }
+}
+
+struct DeploymentConfig {
+    static let skillDir: String = (Paths.packageDir as NSString).deletingLastPathComponent
+    static let file: String = skillDir + "/.state/config.env"
+
+    static let values: [String: String] = {
+        guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return [:] }
+        var result: [String: String] = [:]
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty { result[key] = value }
+        }
+        return result
+    }()
+
+    static func value(_ key: String) -> String? {
+        if let env = ProcessInfo.processInfo.environment[key], !env.isEmpty { return env }
+        if let configured = values[key], !configured.isEmpty { return configured }
+        return nil
+    }
 }
 
 let fullAccessAck = "I_UNDERSTAND_THIS_GRANTS_FULL_ACCESS"
@@ -127,6 +159,14 @@ struct NamedTunnel {
         return v.trimmingCharacters(in: .whitespaces)
     }
 
+    static func fromDeploymentConfig() -> NamedTunnel? {
+        guard let name = DeploymentConfig.value("MAC_DEV_BRIDGE_TUNNEL_NAME"),
+              let publicURL = DeploymentConfig.value("MAC_DEV_BRIDGE_PUBLIC_URL"),
+              let url = URL(string: publicURL),
+              let hostname = url.host, !hostname.isEmpty else { return nil }
+        return NamedTunnel(name: name, hostname: hostname)
+    }
+
     static func fromCloudflaredConfig() -> NamedTunnel? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         for path in ["\(home)/.cloudflared/config.yml", "\(home)/.cloudflared/config.yaml"] {
@@ -156,7 +196,7 @@ struct NamedTunnel {
         return nil
     }
 }
-let httpPort = Int(ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_HTTP_PORT"] ?? "") ?? 8787
+let httpPort = Int(DeploymentConfig.value("MAC_DEV_BRIDGE_HTTP_PORT") ?? "") ?? 8787
 
 // MARK: - Token
 
@@ -241,6 +281,23 @@ enum ClientIdStore {
             let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
+
+        // PM2 deployments persist the generated OAuth client in oauth-state.json rather
+        // than oauth-client-id. Reuse it when switching lifecycle ownership to the app.
+        let oauthStateFile = Paths.dataDir + "/oauth-state.json"
+        if let data = FileManager.default.contents(atPath: oauthStateFile),
+           let object = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = object as? [String: Any],
+           let client = dictionary["client"] as? [String: Any],
+           let existing = client["id"] as? String {
+            let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                try? trimmed.write(toFile: Paths.clientIdFile, atomically: true, encoding: .utf8)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.clientIdFile)
+                return trimmed
+            }
+        }
+
         var bytes = [UInt8](repeating: 0, count: 8)
         _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         let id = "mdb-" + bytes.map { String(format: "%02x", $0) }.joined()
@@ -401,7 +458,7 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         nodePath = loginShellResolve("node")
         cloudflaredPath = loginShellResolve("cloudflared")
-        namedTunnel = NamedTunnel.fromCloudflaredConfig()
+        namedTunnel = NamedTunnel.fromDeploymentConfig() ?? NamedTunnel.fromCloudflaredConfig()
 
         do { token = try TokenStore.loadOrCreate() } catch {
             state = .failed("token: \(error.localizedDescription)")
@@ -423,6 +480,13 @@ final class Controller: NSObject, NSApplicationDelegate {
         // precisely while the menu is open and being read.
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
+
+        // This app is the service owner. Launching it should restore the bridge without
+        // requiring a menu click (important for Login Items and reboot recovery).
+        DispatchQueue.main.async { [weak self] in
+            self?.startBridge()
+            self?.render()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -715,9 +779,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         let tunnel = Process()
         tunnel.executableURL = URL(fileURLWithPath: cf)
         if let named = namedTunnel {
-            // `tunnel run <name>` uses the ingress rules in cloudflared's config, so the
-            // port comes from there rather than being passed here.
-            tunnel.arguments = ["tunnel", "--no-autoupdate", "run", named.name]
+            // Keep the current skill deployment behavior: the named tunnel points at
+            // this app-owned local front end, so no separate cloudflared config file is required.
+            tunnel.arguments = ["tunnel", "--no-autoupdate", "run", "--url", "http://127.0.0.1:\(httpPort)", named.name]
         } else {
             tunnel.arguments = ["tunnel", "--url", "http://127.0.0.1:\(httpPort)", "--no-autoupdate"]
         }
@@ -764,6 +828,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         env["MAC_DEV_BRIDGE_LOG_DIR"] = Paths.logDir
         env["MAC_DEV_BRIDGE_UNLOCK_FILE"] = Paths.unlockFile
         env["MAC_DEV_BRIDGE_OAUTH_CLIENT_ID"] = clientId
+        if let redirects = DeploymentConfig.value("MAC_DEV_BRIDGE_OAUTH_REDIRECT_URIS") {
+            env["MAC_DEV_BRIDGE_OAUTH_REDIRECT_URIS"] = redirects
+        }
+        env["MAC_DEV_BRIDGE_MCP_SERVERS_FILE"] = Paths.dataDir + "/mcp-servers.json"
         if let publicURL { env["MAC_DEV_BRIDGE_PUBLIC_URL"] = publicURL }
         // Never inherit the env-var form of the acknowledgement. bridge.mjs treats it as
         // a standing unlock, so a bridge started with it set cannot be revoked by

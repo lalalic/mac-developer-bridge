@@ -311,7 +311,7 @@ if [[ -d "$JOB_DIR" ]]; then
     kind_label="$(job_kind_label "$meta")"
     # Ownership-check before adding, so a recycled pgid from stale metadata is
     # never signalled — the same protection the pidfile branch already applies.
-    if valid_target "$pgid" && kill -0 "-$pgid" 2>/dev/null; then
+    if valid_target "$pgid" && kill -0 -- "-$pgid" 2>/dev/null; then
       if job_owns_target "$meta" "-$pgid"; then
         targets+=("-$pgid")
         target_kinds+=("$kind_label")
@@ -335,7 +335,7 @@ live_targets() { # echoes the subset of "$@" that still exists
   local t
   for t in "$@"; do
     [[ -n "$t" ]] || continue
-    kill -0 "$t" 2>/dev/null && printf '%s\n' "$t"
+    kill -0 -- "$t" 2>/dev/null && printf '%s\n' "$t"
   done
 }
 
@@ -343,7 +343,7 @@ if (( ${#targets[@]} )); then
   while IFS= read -r t; do
     [[ -n "$t" ]] || continue
     printf 'Stopping %s target %s\n' "$(kind_for_target "$t")" "$t"
-    kill -TERM "$t" 2>/dev/null || true
+    kill -TERM -- "$t" 2>/dev/null || true
     did_something=1
   done < <(live_targets "${targets[@]}")
 fi
@@ -363,11 +363,26 @@ if (( ${#targets[@]} )); then
   while IFS= read -r t; do
     [[ -n "$t" ]] || continue
     printf '  %s target %s ignored SIGTERM, sending SIGKILL\n' "$(kind_for_target "$t")" "$t"
-    kill -9 "$t" 2>/dev/null || true
+    kill -9 -- "$t" 2>/dev/null || true
   done < <(live_targets "${targets[@]}")
 fi
 
 sleep 1
+
+# SIGKILL is asynchronous at the process-group level on macOS. Poll briefly
+# before declaring containment failure; a fixed one-second sleep can observe a
+# still-being-reaped group and report a false failure.
+if (( ${#targets[@]} )); then
+  for _ in 1 2 3 4 5; do
+    pending=0
+    for t in "${targets[@]}"; do
+      [[ -n "$t" ]] || continue
+      if kill -0 -- "$t" 2>/dev/null; then pending=1; fi
+    done
+    (( pending == 0 )) && break
+    sleep 1
+  done
+fi
 
 # --- verify, using exactly the targets that were signalled ------------------
 for script in mcp-http.mjs bridge.mjs chrome-native-host.mjs; do
