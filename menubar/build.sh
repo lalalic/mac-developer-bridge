@@ -79,7 +79,7 @@ SIGN_ID="${MAC_DEV_BRIDGE_SIGN_IDENTITY:-}"
 if [ -z "$SIGN_ID" ]; then
   # First valid codesigning identity, if the keychain has one.
   SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
-    | awk '/\) [0-9A-F]{40} "/ {print $2; exit}')"
+    | awk '!/CSSMERR_/ && /\) [0-9A-F]{40} "/ {print $2; exit}')"
 fi
 
 if [ -n "$SIGN_ID" ] && codesign --force --options runtime --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
@@ -102,7 +102,11 @@ INSTALLED=""
 for dest in /Applications "$HOME/Applications"; do
   [ -d "$dest" ] || mkdir -p "$dest" 2>/dev/null || continue
   if rm -rf "$dest/$NAME.app" 2>/dev/null && cp -R "$APP" "$dest/" 2>/dev/null; then
-    codesign --force --sign - "$dest/$NAME.app" >/dev/null 2>&1 || true
+    # cp preserves the bundle signature. Do not ad-hoc re-sign the installed copy:
+    # changing a real Team ID signature here breaks the stable TCC identity we built for.
+    codesign --verify --deep --strict "$dest/$NAME.app" >/dev/null 2>&1 || {
+      echo "warning: installed app signature verification failed at $dest/$NAME.app" >&2
+    }
     INSTALLED="$dest/$NAME.app"
     break
   fi
