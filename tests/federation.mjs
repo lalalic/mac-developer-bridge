@@ -87,7 +87,7 @@ function stubProvider(overrides = {}) {
   };
 }
 
-async function startHttpFixture({ collide = false, port = 0 } = {}) {
+async function startHttpFixture({ collide = false, port = 0, env = {} } = {}) {
   const portFile = path.join(temporaryRoot, `http-mcp-${crypto.randomBytes(6).toString("hex")}.port`);
   const child = spawn(process.execPath, [httpFixturePath], {
     env: {
@@ -95,6 +95,7 @@ async function startHttpFixture({ collide = false, port = 0 } = {}) {
       HTTP_MCP_COLLIDE: collide ? "1" : undefined,
       HTTP_MCP_PORT: port ? String(port) : undefined,
       HTTP_MCP_PORT_FILE: portFile,
+      ...env,
     },
     stdio: "ignore",
   });
@@ -130,7 +131,7 @@ function textOf(result) {
 
 let bridgeCounter = 0;
 
-async function startBridge({ recheckMs = "400", providerEnv = {} } = {}) {
+async function startBridge({ recheckMs = "400", providerEnv = {}, providers = null } = {}) {
   bridgeCounter += 1;
   const dataDir = path.join(temporaryRoot, `bridge-${bridgeCounter}`);
   const logDir = path.join(dataDir, "logs");
@@ -146,7 +147,7 @@ async function startBridge({ recheckMs = "400", providerEnv = {} } = {}) {
       MAC_DEV_BRIDGE_UNLOCK_FILE: unlockFile,
       MAC_DEV_BRIDGE_AUDIT_MODE: "metadata",
       MAC_DEV_BRIDGE_MCP_SERVERS_JSON: JSON.stringify({
-        providers: [{ key: "stub", command: process.execPath, args: [stubPath], env: providerEnv, mode: "isolated" }],
+        providers: providers || [{ key: "stub", command: process.execPath, args: [stubPath], env: providerEnv, mode: "isolated" }],
       }),
       MAC_DEV_BRIDGE_UNLOCK_RECHECK_MS: recheckMs,
     },
@@ -156,12 +157,16 @@ async function startBridge({ recheckMs = "400", providerEnv = {} } = {}) {
   let bridgeStderr = "";
   child.stderr.on("data", (chunk) => { bridgeStderr += chunk.toString(); });
   const pending = new Map();
+  const notifications = [];
   let nextId = 1;
   readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => {
     let message;
     try { message = JSON.parse(line); } catch { return; }
     const entry = pending.get(message.id);
-    if (!entry) return;
+    if (!entry) {
+      if (message.method) notifications.push(message);
+      return;
+    }
     clearTimeout(entry.timer);
     pending.delete(message.id);
     entry.resolve(message);
@@ -187,6 +192,7 @@ async function startBridge({ recheckMs = "400", providerEnv = {} } = {}) {
     exited,
     dataDir,
     unlockFile,
+    notifications,
     get stderr() { return bridgeStderr; },
   };
 }
@@ -321,6 +327,27 @@ try {
     fixture.child.kill("SIGTERM");
   }
 
+  // --- 4c1. registry order owns cross-provider alias collisions ------------
+  {
+    const first = await makeFederation([
+      stubProvider({ key: "a", env: { STUB_EXTRA_TOOL: "b__c" } }),
+      stubProvider({ key: "a__b", env: { STUB_EXTRA_TOOL: "c" } }),
+    ]);
+    assert.equal(first.status().providers[0].state, "ready");
+    assert.equal(first.status().providers[1].state, "failed");
+    assert.ok(first.hasTool("a__b__c"));
+    assert.match(first.status().providers[1].lastError, /collides with provider 'a'/);
+
+    const reversed = await makeFederation([
+      stubProvider({ key: "a__b", env: { STUB_EXTRA_TOOL: "c" } }),
+      stubProvider({ key: "a", env: { STUB_EXTRA_TOOL: "b__c" } }),
+    ]);
+    assert.equal(reversed.status().providers[0].state, "ready");
+    assert.equal(reversed.status().providers[1].state, "failed");
+    assert.ok(reversed.hasTool("a__b__c"));
+    assert.match(reversed.status().providers[1].lastError, /collides with provider 'a__b'/);
+  }
+
   // --- 4d. generic Bonjour discovery resolves the current endpoint ---------
   {
     const fixture = await startHttpFixture();
@@ -342,6 +369,127 @@ try {
       __testing.executeDnsSd = originalDnsSd;
     }
     fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4e. an HTTP provider may appear after bridge startup ---------------
+  {
+    const first = await startHttpFixture();
+    const port = first.port;
+    first.child.kill("SIGTERM");
+    await poll(() => first.child.exitCode !== null, { attempts: 50, delayMs: 20, label: "the offline HTTP fixture to stop" });
+    let listChanged = 0;
+    const federation = await makeFederation([{
+      key: "late_http",
+      transport: "http",
+      url: `http://127.0.0.1:${port}/mcp`,
+    }], { extra: { onToolsChanged: () => { listChanged += 1; } } });
+    assert.deepEqual(federation.listTools(), [], "offline HTTP providers must not advertise fake schemas");
+    assert.equal(federation.status().providers[0].state, "reconnecting");
+    const replacement = await startHttpFixture({ port });
+    await poll(() => federation.hasTool("late_http__media_search"), { attempts: 100, delayMs: 50, label: "the offline HTTP provider to register after it appears" });
+    assert.ok(listChanged > 0, "a late registration must notify the parent tool surface");
+    assert.equal(textOf(await federation.callTool("late_http__media_search", { query: "late" })), "search:late");
+    replacement.child.kill("SIGTERM");
+  }
+
+  // --- 4f. parent capabilities and notification plumbing stay operational --
+  {
+    const first = await startHttpFixture();
+    const port = first.port;
+    first.child.kill("SIGTERM");
+    await poll(() => first.child.exitCode !== null, { attempts: 50, delayMs: 20, label: "the bridge's offline HTTP fixture to stop" });
+    const bridge = await startBridge({ providers: [{ key: "late_http", transport: "http", url: `http://127.0.0.1:${port}/mcp` }] });
+    const initialized = await bridge.request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "federation-test", version: "1" }, capabilities: {} });
+    assert.equal(initialized.result.capabilities.tools.listChanged, true);
+    const initiallyListed = await bridge.request("tools/list");
+    assert.equal(initiallyListed.result.tools.some((tool) => tool.name === "late_http__media_search"), false);
+    const replacement = await startHttpFixture({ port });
+    await poll(() => bridge.notifications.some((message) => message.method === "notifications/tools/list_changed"), { attempts: 120, delayMs: 50, label: "the parent tools/list_changed notification" });
+    const listed = await bridge.request("tools/list");
+    assert.ok(listed.result.tools.some((tool) => tool.name === "late_http__media_search"));
+    const called = await bridge.request("tools/call", { name: "late_http__media_search", arguments: { query: "bridge" } });
+    assert.equal(called.result.content[0].text, "search:bridge");
+    replacement.child.kill("SIGTERM");
+  }
+
+  // --- 4g. Streamable HTTP framing, intermediate messages, and headers -----
+  {
+    const headersFile = path.join(temporaryRoot, "http-headers.log");
+    const fixture = await startHttpFixture({ env: {
+      HTTP_MCP_SSE: "1",
+      HTTP_MCP_MULTI_SSE: "1",
+      HTTP_MCP_SERVER_REQUEST: "1",
+      HTTP_MCP_REQUIRE_INITIALIZED_NOTIFICATION: "1",
+      HTTP_MCP_HEADERS_FILE: headersFile,
+    } });
+    const federation = await makeFederation([{ key: "stream", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp` }]);
+    const result = await federation.callTool("stream__plain", {});
+    assert.equal(textOf(result), "called:plain", "the final response must survive intermediate SSE messages");
+    const requests = (await fsp.readFile(headersFile, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const initialize = requests.find((entry) => entry.method === "initialize");
+    const initialized = requests.find((entry) => entry.method === "notifications/initialized");
+    const toolsList = requests.find((entry) => entry.method === "tools/list");
+    const toolsCall = requests.find((entry) => entry.method === "tools/call");
+    assert.equal(initialize.headers["mcp-protocol-version"], undefined, "the initialization request must not invent a protocol header");
+    assert.equal(initialized.headers["mcp-protocol-version"], "2025-06-18");
+    assert.equal(toolsList.headers["mcp-protocol-version"], "2025-06-18");
+    assert.equal(toolsCall.headers["mcp-protocol-version"], "2025-06-18");
+    assert.ok(toolsList.headers["mcp-session-id"]);
+    assert.ok(toolsCall.headers["mcp-session-id"]);
+    fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4g1. initialized notification failures block registration -----------
+  {
+    const fixture = await startHttpFixture({ env: { HTTP_MCP_FAIL_INITIALIZED_NOTIFICATION: "1" } });
+    const federation = await makeFederation([{ key: "initfail", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp` }]);
+    const provider = federation.status().providers[0];
+    assert.equal(provider.state, "failed");
+    assert.match(provider.lastError, /HTTP notification returned status 500/);
+    assert.deepEqual(federation.listTools(), []);
+    fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4h. stale session ids restart the remote session and retry ----------
+  {
+    const fixture = await startHttpFixture({ env: { HTTP_MCP_STALE_SESSION: "1" } });
+    const federation = await makeFederation([{ key: "stale", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp` }]);
+    assert.ok(federation.hasTool("stale__plain"), "a 404 for a stale session must recover before tools/list completes");
+    assert.equal(textOf(await federation.callTool("stale__plain", {})), "called:plain");
+    fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4h1. HTTP bodies are capped while the stream is being read ----------
+  {
+    const fixture = await startHttpFixture({ env: { HTTP_MCP_BIG_BYTES: "20000" } });
+    const federation = await makeFederation([{ key: "bounded", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp`, maxResultBytes: 1024 }]);
+    const result = await federation.callTool("bounded__plain", {});
+    assert.equal(result.__structured.code, "RESULT_TOO_LARGE");
+    assert.match(textOf(result), /HTTP result exceeds 1024 bytes/);
+    fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4i. dns-sd browse and lookup are killed after their first match ------
+  {
+    const eventsFile = path.join(temporaryRoot, "dns-sd-events.log");
+    const dnsFixture = path.join(here, "fixtures", "dns-sd-live.mjs");
+    const originalDnsSd = __testing.executeDnsSd;
+    __testing.executeDnsSd = (args, timeoutMs, options) => originalDnsSd(
+      [process.execPath, dnsFixture, ...args.slice(1)],
+      timeoutMs,
+      { ...options },
+    );
+    process.env.DNS_SD_EVENTS_FILE = eventsFile;
+    try {
+      const endpoint = await __testing.resolveBonjourEndpoint({ serviceType: "_mcp._tcp", serviceName: "NeoXPhone", domain: "local", path: "/mcp" });
+      assert.equal(endpoint, "http://127.0.0.1:43123/mcp");
+    } finally {
+      __testing.executeDnsSd = originalDnsSd;
+      delete process.env.DNS_SD_EVENTS_FILE;
+    }
+    const events = (await fsp.readFile(eventsFile, "utf8")).trim().split("\n");
+    assert.equal(events.filter((line) => line.startsWith("start-")).length, 2);
+    assert.equal(events.filter((line) => line.startsWith("stop-")).length, 2, "both long-running dns-sd processes must be terminated and reaped");
   }
 
   // --- 5. child never answers initialize: failed, not hung -----------------

@@ -465,6 +465,13 @@ try {
   // --- misc ---------------------------------------------------------------
   assert.equal((await fetch(`${BASE}/nope`)).status, 404);
   assert.equal((await fetch(`${BASE}/mcp`, { method: "GET", headers: { authorization: `Bearer ${TOKEN}` } })).status, 405);
+  const getSse = await fetch(`${BASE}/mcp`, {
+    headers: { authorization: `Bearer ${TOKEN}`, accept: "text/event-stream" },
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(getSse.status, 200);
+  assert.match(getSse.headers.get("content-type") || "", /text\/event-stream/);
+  await getSse.body?.cancel();
   ok("404 off-path, 405 on GET /mcp");
 
   // --- handshake replay: kill the child, next call must still work ----------
