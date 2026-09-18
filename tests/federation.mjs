@@ -20,6 +20,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const bridgePath = path.resolve(here, "..", "bridge.mjs");
 const disablePath = path.resolve(here, "..", "scripts", "disable.sh");
 const stubPath = path.join(here, "fixtures", "stub-mcp-server.mjs");
+const httpFixturePath = path.join(here, "fixtures", "http-mcp-server.mjs");
 // macOS: /var is a symlink to /private/var, so an unresolved temp path and the
 // path a child reports back are different strings for the same directory.
 const temporaryRoot = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "mac-developer-bridge-federation-")));
@@ -84,6 +85,34 @@ function stubProvider(overrides = {}) {
     mode: "isolated",
     ...rest,
   };
+}
+
+async function startHttpFixture({ collide = false, port = 0 } = {}) {
+  const portFile = path.join(temporaryRoot, `http-mcp-${crypto.randomBytes(6).toString("hex")}.port`);
+  const child = spawn(process.execPath, [httpFixturePath], {
+    env: {
+      ...process.env,
+      HTTP_MCP_COLLIDE: collide ? "1" : undefined,
+      HTTP_MCP_PORT: port ? String(port) : undefined,
+      HTTP_MCP_PORT_FILE: portFile,
+    },
+    stdio: "ignore",
+  });
+  spawnedPids.add(child.pid);
+  let deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) throw new Error(`HTTP MCP fixture exited with ${child.exitCode}`);
+    try {
+      const text = await fsp.readFile(portFile, "utf8");
+      const resolvedPort = Number.parseInt(text.trim(), 10);
+      if (Number.isInteger(resolvedPort)) return { child, port: resolvedPort, portFile };
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  child.kill("SIGKILL");
+  throw new Error("HTTP MCP fixture did not report its port");
 }
 
 async function poll(predicate, { attempts = 100, delayMs = 100, label = "condition" } = {}) {
@@ -237,6 +266,82 @@ try {
     assert.equal(status.providers[0].state, "failed");
     assert.match(status.providers[0].lastError, /collides with a built-in bridge tool/);
     assert.equal(federation.hasTool("stub__echo"), false, "a colliding provider must not shadow the built-in tool");
+  }
+
+  // --- 4a. HTTP providers resolve, call, fail locally, and recover ----------
+  {
+    const fixture = await startHttpFixture();
+    const federation = await makeFederation([
+      stubProvider({ key: "native" }),
+      { key: "remote", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp`, callTimeoutMs: 1_500 },
+    ]);
+    const provider = federation.status().providers.find((entry) => entry.key === "remote");
+    assert.equal(provider.state, "ready");
+    assert.equal(provider.transport, "http");
+    assert.equal(provider.endpoint, `http://127.0.0.1:${fixture.port}/mcp`);
+    assert.ok(federation.hasTool("remote__media_search"));
+    assert.ok(federation.hasTool("remote__plain"));
+    assert.equal(textOf(await federation.callTool("remote__media_search", { query: "cats" })), "search:cats");
+
+    fixture.child.kill("SIGTERM");
+    await poll(async () => fixture.child.exitCode !== null, { label: "the HTTP fixture to stop", attempts: 30, delayMs: 20 });
+    const failedLocally = await federation.callTool("remote__media_search", { query: "again" });
+    assert.equal(failedLocally.__isError, true);
+    assert.match(textOf(failedLocally), /Call to 'remote__media_search' failed: fetch failed/);
+    const unavailable = await federation.callTool("remote__media_search", { query: "again" });
+    assert.equal(unavailable.__isError, true);
+    assert.match(textOf(unavailable), /Provider 'remote' is unavailable/);
+    assert.equal(textOf(await federation.callTool("native__echo", { text: "still-native" })), "echo:still-native");
+
+    const replacement = await startHttpFixture({ port: fixture.port });
+    const recovered = await federation.callTool("remote__media_search", { query: "after-recovery" });
+    assert.equal(textOf(recovered), "search:after-recovery");
+    assert.equal(federation.status().providers.find((entry) => entry.key === "remote").state, "ready");
+    replacement.child.kill("SIGTERM");
+  }
+
+  // --- 4b. dotted child names get deterministic portable aliases -----------
+  {
+    const fixture = await startHttpFixture();
+    const federation = await makeFederation([{ key: "neox_phone", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp` }]);
+    assert.deepEqual(federation.listTools().map((tool) => tool.name).sort(), ["neox_phone__media_search", "neox_phone__plain"]);
+    assert.equal(textOf(await federation.callTool("neox_phone__media_search", { query: "target" })), "search:target");
+    assert.equal(textOf(await federation.callTool("neox_phone__plain", {})), "called:plain");
+    fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4c. deterministic alias collisions reject the provider -------------
+  {
+    const fixture = await startHttpFixture({ collide: true });
+    const federation = await makeFederation([{ key: "collider", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp` }]);
+    const provider = federation.status().providers[0];
+    assert.equal(provider.state, "failed");
+    assert.match(provider.lastError, /collides with provider 'collider'/);
+    assert.deepEqual(federation.listTools(), []);
+    fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4d. generic Bonjour discovery resolves the current endpoint ---------
+  {
+    const fixture = await startHttpFixture();
+    const originalDnsSd = __testing.executeDnsSd;
+    __testing.executeDnsSd = async (args) => {
+      if (args[1] === "-B") return "BROWSE\n0 eth0 IPv4 NeoXPhone ._mcp._tcp. local.\n";
+      return `LOOKUP\n0 NeoXPhone._mcp._tcp.local. can be reached via 127.0.0.1:${fixture.port} (interface 12)\n`;
+    };
+    try {
+      const federation = await makeFederation([{
+        key: "remote",
+        transport: "http",
+        discovery: { serviceType: "_mcp._tcp", serviceName: "NeoXPhone", path: "/mcp" },
+      }]);
+      const provider = federation.status().providers[0];
+      assert.equal(provider.endpoint, `http://127.0.0.1:${fixture.port}/mcp`);
+      assert.equal(provider.state, "ready");
+    } finally {
+      __testing.executeDnsSd = originalDnsSd;
+    }
+    fixture.child.kill("SIGTERM");
   }
 
   // --- 5. child never answers initialize: failed, not hung -----------------
