@@ -155,7 +155,7 @@ job_owns_target() { # metadata-path, target ("-pgid" or "pid")
 
   lstart="$(ps -o lstart= -p "$pid" 2>/dev/null || true)"
   [[ -n "$lstart" ]] || return 1
-  proc_epoch="$(date -j -f '%a %e %b %H:%M:%S %Y' "$lstart" +%s 2>/dev/null || true)"
+  proc_epoch="$(date -j -f '%a %b %e %H:%M:%S %Y' "$lstart" +%s 2>/dev/null || true)"
   # Unparseable start time: fail closed on the signal, not on the report.
   [[ -n "$proc_epoch" ]] || return 1
   # 5s slack for clock granularity between the two sources.
