@@ -38,6 +38,8 @@ if (process.env.STUB_SPAWN_LOG) {
 // misspelled or nonexistent flag, which turns an intended restriction into no
 // restriction with no error anywhere.
 if (process.argv.includes("--help")) {
+  const helpDelayMs = Number(process.env.STUB_HELP_DELAY_MS || 0);
+  if (helpDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, helpDelayMs));
   process.stdout.write([
     "Options:",
     "  --allowedUrlPattern   Restrict the browser to matching URLs  [array]",

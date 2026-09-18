@@ -208,8 +208,10 @@ let starting = null;
 let nextId = 1;
 const pending = new Map(); // serverId -> waiter
 const serverEventStreams = new Set();
+const GLOBAL_SAFE_NOTIFICATIONS = new Set(["notifications/tools/list_changed"]);
 
 function publishServerMessage(message) {
+  if (!GLOBAL_SAFE_NOTIFICATIONS.has(message?.method)) return;
   const frame = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
   for (const stream of [...serverEventStreams]) {
     if (stream.writableEnded || stream.destroyed) {

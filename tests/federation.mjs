@@ -322,7 +322,7 @@ try {
     const federation = await makeFederation([{ key: "collider", transport: "http", url: `http://127.0.0.1:${fixture.port}/mcp` }]);
     const provider = federation.status().providers[0];
     assert.equal(provider.state, "failed");
-    assert.match(provider.lastError, /collides with provider 'collider'/);
+    assert.match(provider.lastError, /duplicate normalized tool alias/);
     assert.deepEqual(federation.listTools(), []);
     fixture.child.kill("SIGTERM");
   }
@@ -419,6 +419,7 @@ try {
       HTTP_MCP_SSE: "1",
       HTTP_MCP_MULTI_SSE: "1",
       HTTP_MCP_SERVER_REQUEST: "1",
+      HTTP_MCP_WAIT_FOR_SERVER_REQUEST_REPLY: "1",
       HTTP_MCP_REQUIRE_INITIALIZED_NOTIFICATION: "1",
       HTTP_MCP_HEADERS_FILE: headersFile,
     } });
@@ -437,6 +438,42 @@ try {
     assert.ok(toolsList.headers["mcp-session-id"]);
     assert.ok(toolsCall.headers["mcp-session-id"]);
     fixture.child.kill("SIGTERM");
+  }
+
+  // --- 4g2. refresh collisions are transactional -------------------------
+  {
+    const duplicate = await startHttpFixture({ env: {
+      HTTP_MCP_SSE: "1",
+      HTTP_MCP_REFRESH_ON_CALL: "1",
+      HTTP_MCP_REFRESH_TOOLS: "media.search,media_search,plain",
+    } });
+    const federation = await makeFederation([{ key: "refresh", transport: "http", url: `http://127.0.0.1:${duplicate.port}/mcp` }]);
+    const before = federation.listTools().map((tool) => tool.name);
+    assert.equal(textOf(await federation.callTool("refresh__plain", {})), "called:plain");
+    await poll(() => federation.status().providers[0].lastError?.includes("duplicate normalized tool alias"), { attempts: 50, delayMs: 20, label: "same-provider refresh collision" });
+    assert.equal(federation.status().providers[0].state, "ready");
+    assert.deepEqual(federation.listTools().map((tool) => tool.name), before, "a duplicate refresh must preserve the advertised surface");
+    assert.equal(textOf(await federation.callTool("refresh__plain", {})), "called:plain");
+    duplicate.child.kill("SIGTERM");
+
+    const first = await startHttpFixture({ env: { HTTP_MCP_TOOLS: "b__c" } });
+    const second = await startHttpFixture({ env: {
+      HTTP_MCP_SSE: "1",
+      HTTP_MCP_TOOLS: "plain",
+      HTTP_MCP_REFRESH_ON_CALL: "1",
+      HTTP_MCP_REFRESH_TOOLS: "c",
+    } });
+    const cross = await makeFederation([
+      { key: "a", transport: "http", url: `http://127.0.0.1:${first.port}/mcp` },
+      { key: "a__b", transport: "http", url: `http://127.0.0.1:${second.port}/mcp` },
+    ]);
+    const crossBefore = cross.listTools().map((tool) => tool.name);
+    assert.equal(textOf(await cross.callTool("a__b__plain", {})), "called:plain");
+    await poll(() => cross.status().providers.find((provider) => provider.key === "a__b").lastError?.includes("collides with provider 'a'"), { attempts: 50, delayMs: 20, label: "cross-provider refresh collision" });
+    assert.deepEqual(cross.listTools().map((tool) => tool.name), crossBefore, "a later provider must not release its old claim before a collision is validated");
+    assert.equal(textOf(await cross.callTool("a__b__plain", {})), "called:plain");
+    first.child.kill("SIGTERM");
+    second.child.kill("SIGTERM");
   }
 
   // --- 4g1. initialized notification failures block registration -----------
@@ -1467,6 +1504,34 @@ exec ${realPgrep} "$@"
 
   // --- 27. killNow reports containment honestly, and names survivors ------
   {
+    const midStartDataDir = path.join(temporaryRoot, "mid-start");
+    const midStartJobDir = path.join(midStartDataDir, "jobs");
+    await fsp.mkdir(midStartJobDir, { recursive: true, mode: 0o700 });
+    const midStartFederation = createFederation({
+      audit: noopAudit,
+      stderr: quietStderr(),
+      dataDir: midStartDataDir,
+      jobDir: midStartJobDir,
+      nowIso: () => new Date().toISOString(),
+      writeJobMetadata: async (metadata) => {
+        await fsp.writeFile(path.join(midStartJobDir, `${metadata.id}.json`), `${JSON.stringify(metadata)}\n`, { mode: 0o600 });
+      },
+      version: "test",
+      registryJson: JSON.stringify({ providers: [stubProvider({
+        key: "midstart",
+        env: { STUB_HELP_DELAY_MS: "1000" },
+        flagCheck: { args: [stubPath, "--help"], requireFlags: ["--allowedUrlPattern"], timeoutMs: 3_000 },
+      })] }),
+      registryPath: undefined,
+    });
+    federations.push(midStartFederation);
+    const midStartPromise = midStartFederation.start();
+    await poll(() => midStartFederation.status().providers[0]?.state === "starting", { attempts: 100, delayMs: 10, label: "provider to enter starting state" });
+    const [midStart] = midStartFederation.killAll();
+    assert.equal(midStart.pgid, null);
+    assert.equal(midStart.containmentVerified, false, "revocation during start must not claim containment before a child existed");
+    await midStartPromise;
+
     // A clean kill. Before the bounded retry this was false every single time:
     // the verdict was read one line after the SIGKILL, from
     // process.kill(-pgid, 0), against a child this process is the parent of and
