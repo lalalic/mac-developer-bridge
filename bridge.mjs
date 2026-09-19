@@ -774,6 +774,20 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   {
+    name: "chatgpt_conversation_delete",
+    title: "Delete an experimental ChatGPT browser conversation",
+    description: "Delete one exact ChatGPT conversation through the signed-in page without exposing browser credentials. Deletion is idempotent for an already-missing conversation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        conversation_id: { type: "string", pattern: "^[A-Za-z0-9_-]{8,128}$", description: "Exact ChatGPT conversation id to delete." },
+      },
+      required: ["conversation_id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  },
+  {
     name: "chrome_workspace_setup",
     title: "Set up MDB Chrome workspace",
     description: "Provision the desired capacity for the extension-owned MDB Chrome tab group and reusable background-tab pool. The target is persisted even when Chrome is not focused. Missing tabs are created immediately only while the existing MDB Chrome window is already naturally focused; otherwise expansion remains pending until the next natural focus, so MDB never steals focus.",
@@ -3201,6 +3215,22 @@ async function dispatchTool(name, args) {
         ...(tabId === undefined ? {} : { tabId }),
         ...(normalizedAttachments.length ? { attachments: normalizedAttachments } : {}),
       }, { timeoutMs: maxRuntimeSeconds * 1000 + 120_000 });
+    }
+
+    case "chatgpt_conversation_delete": {
+      if (args === null || typeof args !== "object" || Array.isArray(args)) {
+        throw new Error("chatgpt_conversation_delete arguments must be an object");
+      }
+      const keys = Object.keys(args);
+      const unknown = keys.filter((key) => key !== "conversation_id");
+      if (unknown.length > 0) throw new Error(`Unknown chatgpt_conversation_delete argument(s): ${unknown.join(", ")}`);
+      const conversationId = requireString(args, "conversation_id");
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(conversationId)) {
+        const error = new Error("'conversation_id' must be an 8-128 character ChatGPT conversation id");
+        error.code = "CHATGPT_CONVERSATION_ID_INVALID";
+        throw error;
+      }
+      return await callBackgroundChrome(name, "tabs.chatgptConversationDelete", { conversationId }, { timeoutMs: 120_000 });
     }
 
     case "chrome_workspace_setup": {

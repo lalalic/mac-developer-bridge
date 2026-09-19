@@ -94,6 +94,13 @@ const chromeServer = net.createServer((socket) => {
           extension: { profile: { signedIn: true, matchesBinding: true } },
           profileError: null,
         }
+        : request.method === "tabs.chatgptConversationDelete"
+          ? {
+            ok: true,
+            deleted: true,
+            already_deleted: false,
+            conversation_id: request.args?.conversationId || "http-conversation-test",
+          }
         : {
           ok: true,
           complete: true,
@@ -175,9 +182,9 @@ function rpc(body, token = TOKEN) {
   });
 }
 
-function experimentalConversation(body, token = TOKEN, extraHeaders = {}) {
+function experimentalConversation(body, token = TOKEN, extraHeaders = {}, method = "POST") {
   return fetch(`${BASE}/experimental/chatgpt/conversation`, {
-    method: "POST",
+    method,
     headers: {
       "content-type": "application/json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -362,6 +369,15 @@ try {
   assert.equal(continuedBody.conversation_id, "http-conversation-test");
   assert.equal(browserCalls.at(-1).args.conversationId, "http-conversation-test");
   ok("experimental ChatGPT route continues one exact conversation");
+
+  const deleted = await experimentalConversation({ conversation_id: "http-conversation-test" }, TOKEN, {}, "DELETE");
+  assert.equal(deleted.status, 200);
+  const deletedBody = await deleted.json();
+  assert.equal(deletedBody.deleted, true);
+  assert.equal(deletedBody.conversation_id, "http-conversation-test");
+  assert.equal(browserCalls.at(-1).method, "tabs.chatgptConversationDelete");
+  assert.equal(browserCalls.at(-1).args.conversationId, "http-conversation-test");
+  ok("experimental ChatGPT route deletes one exact conversation");
 
   const rawStarted = await experimentalConversation({ prompt: "raw diagnostic", transport: "raw" });
   assert.equal(rawStarted.status, 200);
