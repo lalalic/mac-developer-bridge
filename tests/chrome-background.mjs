@@ -250,7 +250,8 @@ try {
   assert.match(workerSource, /case "tabs\.chatgptConversationStart"/);
   assert.match(workerSource, /transport === "runtime"[\s\S]*?pageChatgptRuntimeConversationStart[\s\S]*?pageChatgptConversationStart/);
   assert.match(workerSource, /modelReadyDeadline = Date\.now\(\) \+ 20_000/);
-  assert.match(workerSource, /CHATGPT_RUNTIME_MODEL_MISMATCH/);
+  assert.doesNotMatch(workerSource, /CHATGPT_RUNTIME_MODEL_MISMATCH/);
+  assert.match(workerSource, /new URLSearchParams\(\{ thinking_effort: thinkingEffort \}\)/);
   assert.match(workerSource, /CHATGPT_RUNTIME_NOT_READY/);
   const nativeHostSource = await fs.readFile(path.join(root, "scripts", "chrome-native-host.mjs"), "utf8");
   assert.match(nativeHostSource, /MAX_REQUEST_TIMEOUT_MS = 3_720_000/);
@@ -359,6 +360,8 @@ try {
   assert.equal(host.seen.at(-1).method, "tabs.chatgptConversationStart");
   assert.equal(host.seen.at(-1).args.prompt, sensitivePrompt);
   assert.equal(host.seen.at(-1).args.transport, "runtime");
+  assert.equal(host.seen.at(-1).args.model, undefined);
+  assert.equal(host.seen.at(-1).args.thinkingEffort, "standard");
   assert.equal(host.seen.at(-1).args.maxRuntimeSeconds, 3300);
   assert.equal(host.seen.at(-1).args.continueInWork, true);
   assert.equal(host.seen.at(-1).args.projectId, chatgptProjectId);
