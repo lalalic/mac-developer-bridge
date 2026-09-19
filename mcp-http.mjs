@@ -1374,7 +1374,7 @@ function experimentalToolStatus(result) {
 }
 
 async function experimentalChatgptConversation(req, res) {
-  if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+  if (!["POST", "DELETE"].includes(req.method)) return send(res, 405, { error: "method not allowed" });
   if (!isDirectLoopbackRequest(req)) {
     log(`403 on ${EXPERIMENTAL_CHATGPT_PATH}: direct loopback request required`);
     return send(res, 403, { error: "direct loopback request required" }, { "cache-control": "no-store" });
@@ -1405,13 +1405,13 @@ async function experimentalChatgptConversation(req, res) {
 
   try {
     await ensureLocalBridgeInitialized();
-    const requestedRuntimeSeconds = Number(args.max_runtime_seconds || 600);
+    const requestedRuntimeSeconds = req.method === "DELETE" ? 30 : Number(args.max_runtime_seconds || 600);
     const bridgeTimeoutMs = Math.max(30, Math.min(3600, Number.isFinite(requestedRuntimeSeconds) ? requestedRuntimeSeconds : 600)) * 1000 + 120_000;
     const reply = await callBridge({
       jsonrpc: "2.0",
       id: `experimental-chatgpt-${crypto.randomUUID()}`,
       method: "tools/call",
-      params: { name: "chatgpt_conversation_start", arguments: args },
+      params: { name: req.method === "DELETE" ? "chatgpt_conversation_delete" : "chatgpt_conversation_start", arguments: args },
     }, bridgeTimeoutMs);
     if (reply?.error) {
       log(`${EXPERIMENTAL_CHATGPT_PATH} bridge error: ${reply.error.message || "unknown"}`);

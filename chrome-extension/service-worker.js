@@ -2714,6 +2714,36 @@ async function pageChatgptRuntimeConversationStart(input) {
   }
 }
 
+async function pageChatgptConversationDelete(input) {
+  const fail = (code, message, details = {}) => ({ ok: false, error: { code, message, ...details } });
+  const conversationId = String(input?.conversationId || "");
+  if (location.origin !== "https://chatgpt.com") return fail("CHATGPT_TAB_UNAVAILABLE", "The selected tab is not a chatgpt.com page.");
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(conversationId)) return fail("CHATGPT_CONVERSATION_ID_INVALID", "The ChatGPT conversation id is invalid.");
+  let accessToken = "";
+  try {
+    const sessionResponse = await fetch("/api/auth/session", { method: "GET", credentials: "same-origin", headers: { accept: "application/json" } });
+    if (!sessionResponse.ok) return fail("CHATGPT_SESSION_UNAVAILABLE", "ChatGPT did not return an authenticated browser session.", { status: sessionResponse.status });
+    const session = await sessionResponse.json();
+    accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+  } catch {
+    return fail("CHATGPT_SESSION_UNAVAILABLE", "The browser could not read the current ChatGPT session.");
+  }
+  if (!accessToken) return fail("CHATGPT_SESSION_UNAVAILABLE", "The authenticated ChatGPT session did not expose an access token.");
+  try {
+    const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ is_visible: false }),
+    });
+    if (response.status === 404) return { ok: true, deleted: true, already_deleted: true, conversation_id: conversationId };
+    if (!response.ok) return fail("CHATGPT_CONVERSATION_DELETE_FAILED", "ChatGPT refused conversation deletion.", { status: response.status });
+    return { ok: true, deleted: true, already_deleted: false, conversation_id: conversationId };
+  } catch {
+    return fail("CHATGPT_CONVERSATION_DELETE_FAILED", "The signed-in page could not delete the conversation.");
+  }
+}
+
 async function pageChatgptConversationStart(input) {
   const MAX_PROMPT_BYTES = 4_000_000;
   const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -3549,6 +3579,31 @@ async function dispatch(message) {
     case "tabs.removeTaskMutationProbe": {
       const tab = await getApprovedTab(args.tabId, compiled);
       return await executeInTab(tab.id, pageRemoveTaskMutationProbe, [], "MAIN");
+    }
+
+    case "tabs.chatgptConversationDelete": {
+      const conversationId = String(args.conversationId || "");
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(conversationId)) {
+        const error = new Error("ChatGPT conversation id is invalid.");
+        error.code = "CHATGPT_CONVERSATION_ID_INVALID";
+        throw error;
+      }
+      const leased = await leaseWorkspaceTab(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`, compiled);
+      let stopWorkspaceLeaseHeartbeat = () => {};
+      try {
+        stopWorkspaceLeaseHeartbeat = await startWorkspaceLeaseHeartbeat(leased.tabId);
+        const result = await executeInTab(leased.tabId, pageChatgptConversationDelete, [{ conversationId }], "MAIN");
+        if (result?.ok === false) {
+          const error = new Error(result.error?.message || "ChatGPT conversation deletion failed.");
+          error.code = result.error?.code || "CHATGPT_CONVERSATION_DELETE_FAILED";
+          error.details = result.error || null;
+          throw error;
+        }
+        return { ...result, tab_id: leased.tabId };
+      } finally {
+        stopWorkspaceLeaseHeartbeat();
+        await releaseWorkspaceTab(leased.tabId).catch(() => {});
+      }
     }
 
     case "tabs.chatgptConversationStart": {

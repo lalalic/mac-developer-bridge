@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const workerSource = await fs.readFile(path.join(root, "chrome-extension", "service-worker.js"), "utf8");
-const match = workerSource.match(/async function pageChatgptRuntimeConversationStart\(input\) \{([\s\S]*?)\n\}\n\nasync function pageChatgptConversationStart/);
+const match = workerSource.match(/async function pageChatgptRuntimeConversationStart\(input\) \{([\s\S]*?)\n\}\n\nasync function pageChatgptConversationDelete/);
 assert.ok(match, "pageChatgptRuntimeConversationStart must remain a standalone executable function");
 const functionSource = `(async function pageChatgptRuntimeConversationStart(input) {${match[1]}\n})`;
 assert.match(functionSource, /observedResponseSettled/);

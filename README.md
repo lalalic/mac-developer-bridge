@@ -184,9 +184,17 @@ curl --fail-with-body \
   --header "Authorization: Bearer $MAC_DEV_BRIDGE_HTTP_TOKEN" \
   --header 'Content-Type: application/json' \
   --data '{"prompt":"Continue the assigned work","conversation_id":"<returned-conversation-id>"}'
+
+# Delete the exact conversation when the owning job is terminal:
+curl --fail-with-body \
+  --request DELETE \
+  --url http://127.0.0.1:8787/experimental/chatgpt/conversation \
+  --header "Authorization: Bearer $MAC_DEV_BRIDGE_HTTP_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{"conversation_id":"<returned-conversation-id>"}'
 ```
 
-That route accepts only a direct loopback connection with the static MDB bearer. It rejects OAuth credentials and forwarded/tunnel requests, returns `Cache-Control: no-store`, and wraps the exact MCP operation rather than exposing the Chrome native-host socket.
+That route accepts only a direct loopback connection with the static MDB bearer. `POST` starts or continues a conversation and `DELETE` removes one exact conversation through the signed-in page; deletion is idempotent when the conversation is already gone. It rejects OAuth credentials and forwarded/tunnel requests, returns `Cache-Control: no-store`, and wraps the exact MCP operation rather than exposing the Chrome native-host socket.
 
 #### Experimental ChatGPT browser model
 
