@@ -150,6 +150,10 @@ function workspaceIdleUrl() {
   return chrome.runtime.getURL("workspace.html");
 }
 
+function isWorkspaceIdleUrl(url) {
+  return typeof url === "string" && url === workspaceIdleUrl();
+}
+
 async function loadWorkspaceState() {
   const stored = (await chrome.storage.local.get(WORKSPACE_KEY))?.[WORKSPACE_KEY];
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
@@ -399,6 +403,19 @@ async function waitForApprovedNavigation(tabId, compiled, {
     const changed = currentUrl && currentUrl !== previousUrl;
     const sameRequestedPage = currentUrl && currentUrl === previousUrl && requestedUrl === previousUrl;
     if (changed || sameRequestedPage) {
+      // A leased workspace tab starts on our own extension-owned idle page.
+      // chrome.tabs.update() may report that committed URL for a short interval
+      // before the requested external navigation commits. Treat only that exact
+      // idle page as an in-flight state; every other off-grant URL still fails.
+      if (isWorkspaceIdleUrl(currentUrl) && requestedUrl && requestedUrl !== currentUrl) {
+        if (Date.now() >= deadline) {
+          const error = new Error(`Chrome navigation did not settle on an approved page within ${timeoutMs}ms (requested ${requestedUrl}, last ${currentUrl}).`);
+          error.code = "CHROME_NAVIGATION_TIMEOUT";
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
+      }
       if (!urlAllowed(currentUrl, compiled)) {
         const error = new Error(`Navigation left the approved URL scope: ${currentUrl || "<empty>"}`);
         error.code = "CHROME_URL_NOT_APPROVED";
