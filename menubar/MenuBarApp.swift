@@ -71,6 +71,13 @@ struct Paths {
     }()
 
     static var frontEnd: String { packageDir + "/mcp-http.mjs" }
+    static var runtimeStartScript: String {
+        if let explicit = ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_RUNTIME_START_SCRIPT"],
+           !explicit.isEmpty {
+            return explicit
+        }
+        return packageDir + "/scripts/runtime-start.sh"
+    }
 
     static let dataDir: String = {
         if let explicit = ProcessInfo.processInfo.environment["MAC_DEV_BRIDGE_DATA_DIR"], !explicit.isEmpty {
@@ -98,6 +105,7 @@ struct Paths {
     static var settingsFile: String { dataDir + "/settings.json" }
     static var httpLog: String { logDir + "/http.stderr.log" }
     static var tunnelLog: String { logDir + "/tunnel.stderr.log" }
+    static var runtimeStartLog: String { logDir + "/runtime-start.log" }
 }
 
 struct DeploymentConfig {
@@ -322,6 +330,7 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     private var httpProcess: Process?
     private var tunnelProcess: Process?
+    private var runtimeStartProcess: Process?
     private var tunnelReader: FileHandle?
 
     private var token = ""
@@ -484,6 +493,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         // This app is the service owner. Launching it should restore the bridge without
         // requiring a menu click (important for Login Items and reboot recovery).
         DispatchQueue.main.async { [weak self] in
+            self?.startRuntimeScript()
             self?.startBridge()
             self?.render()
         }
@@ -738,6 +748,43 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     // MARK: Lifecycle
+
+    /// Run the operator-owned runtime bootstrap as a real child of MacDevBridge.app.
+    ///
+    /// This intentionally stays outside the bridge Start/Stop lifecycle: services
+    /// started by the script (for example a PM2 daemon) are machine runtime services,
+    /// not transport children. The script is a normal editable file so adding or
+    /// removing services never requires rebuilding this Swift app.
+    private func startRuntimeScript() {
+        let script = Paths.runtimeStartScript
+        guard FileManager.default.fileExists(atPath: script) else { return }
+
+        try? FileManager.default.createDirectory(atPath: Paths.logDir,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [script]
+        process.currentDirectoryURL = URL(fileURLWithPath: Paths.packageDir)
+        process.environment = childEnvironment(publicURL: nil)
+        process.standardOutput = appendHandle(Paths.runtimeStartLog)
+        process.standardError = appendHandle(Paths.runtimeStartLog)
+        process.terminationHandler = { [weak self] finished in
+            NSLog("MacDevBridge: runtime start script exited with status %d", finished.terminationStatus)
+            DispatchQueue.main.async {
+                if self?.runtimeStartProcess === finished {
+                    self?.runtimeStartProcess = nil
+                }
+            }
+        }
+        do {
+            try process.run()
+            runtimeStartProcess = process
+        } catch {
+            NSLog("MacDevBridge: could not start runtime script %@: %@", script, error.localizedDescription)
+        }
+    }
 
     private func startBridge() {
         guard nodePath != nil else {
