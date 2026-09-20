@@ -150,10 +150,6 @@ function workspaceIdleUrl() {
   return chrome.runtime.getURL("workspace.html");
 }
 
-function isWorkspaceIdleUrl(url) {
-  return typeof url === "string" && url === workspaceIdleUrl();
-}
-
 async function loadWorkspaceState() {
   const stored = (await chrome.storage.local.get(WORKSPACE_KEY))?.[WORKSPACE_KEY];
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
@@ -403,19 +399,6 @@ async function waitForApprovedNavigation(tabId, compiled, {
     const changed = currentUrl && currentUrl !== previousUrl;
     const sameRequestedPage = currentUrl && currentUrl === previousUrl && requestedUrl === previousUrl;
     if (changed || sameRequestedPage) {
-      // A leased workspace tab starts on our own extension-owned idle page.
-      // chrome.tabs.update() may report that committed URL for a short interval
-      // before the requested external navigation commits. Treat only that exact
-      // idle page as an in-flight state; every other off-grant URL still fails.
-      if (isWorkspaceIdleUrl(currentUrl) && requestedUrl && requestedUrl !== currentUrl) {
-        if (Date.now() >= deadline) {
-          const error = new Error(`Chrome navigation did not settle on an approved page within ${timeoutMs}ms (requested ${requestedUrl}, last ${currentUrl}).`);
-          error.code = "CHROME_NAVIGATION_TIMEOUT";
-          throw error;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        continue;
-      }
       if (!urlAllowed(currentUrl, compiled)) {
         const error = new Error(`Navigation left the approved URL scope: ${currentUrl || "<empty>"}`);
         error.code = "CHROME_URL_NOT_APPROVED";
@@ -1964,102 +1947,12 @@ async function pageChatgptPersistedAssistantRead(input) {
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     });
     if (document.readyState === "complete" && assistantText && stableReads >= 2 && !generating) {
-      const outputCandidates = [];
-      const seenUrls = new Set();
-      const addCandidate = (url, name, kind) => {
-        const raw = String(url || "");
-        if (!raw || seenUrls.has(raw)) return;
-        let parsed; try { parsed = new URL(raw, location.href); } catch { return; }
-        if (!['https:', 'blob:'].includes(parsed.protocol)) return;
-        seenUrls.add(parsed.href);
-        outputCandidates.push({ url: parsed.href, name: String(name || "").slice(0,255), kind });
-      };
-      for (const img of [...(latest?.querySelectorAll?.('img[src]') || [])]) addCandidate(img.src, img.alt || '', 'image');
-      for (const anchor of [...(latest?.querySelectorAll?.('a[href]') || [])]) {
-        const href = anchor.href || anchor.getAttribute('href') || '';
-        const label = String(anchor.getAttribute('download') || anchor.textContent || '').trim();
-        if (anchor.hasAttribute('download') || /download|file|sandbox|\/files?\//i.test(href) || /\.(pdf|docx?|xlsx?|pptx?|csv|txt|md|json|zip|png|jpe?g|webp)(?:$|[?#])/i.test(href)) addCandidate(href, label, 'file');
-      }
-      const assistantOutputs = [];
-      let outputBytes = 0;
-      const encodeOutputBlob = async (blob, name, kind = 'file') => {
-        if (!blob || blob.size <= 0 || blob.size > 12 * 1024 * 1024 || outputBytes + blob.size > 24 * 1024 * 1024) return;
-        outputBytes += blob.size;
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        let binary = '';
-        for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
-        assistantOutputs.push({ type: kind, name: String(name || 'attachment').slice(0,255), mime_type: blob.type || 'application/octet-stream', size: blob.size, data_base64: btoa(binary) });
-      };
-      const downloadButtons = [...(latest?.querySelectorAll?.('button[aria-label^="Download "]') || [])].slice(0,4);
-      for (const button of downloadButtons) {
-        const name = String(button.getAttribute('aria-label') || '').replace(/^Download\s+/i,'').trim() || 'download';
-        let capturedBlob = null;
-        const capturePromises = [];
-        const originalFetch = globalThis.fetch;
-        const originalOpen = globalThis.open;
-        const originalAnchorClick = globalThis.HTMLAnchorElement?.prototype?.click;
-        const originalCreateObjectURL = globalThis.URL?.createObjectURL;
-        try {
-          globalThis.fetch = async function(...args) {
-            const response = await originalFetch.apply(this,args);
-            try {
-              const requestUrl = String(response.url || (typeof args[0] === 'string' ? args[0] : args[0]?.url || ''));
-              const disposition = String(response.headers?.get?.('content-disposition') || '');
-              const contentType = String(response.headers?.get?.('content-type') || '');
-              if (/attachment|filename=/i.test(disposition) || /download|file|sandbox/i.test(requestUrl) || (!/json|html|event-stream/i.test(contentType) && Number(response.headers?.get?.('content-length') || 0) > 0)) {
-                capturePromises.push(response.clone().blob().then((blob)=>{ if(!capturedBlob) capturedBlob=blob; }).catch(()=>{}));
-              }
-            } catch {}
-            return response;
-          };
-          if (typeof originalOpen === 'function') globalThis.open = function(){ return null; };
-          if (originalAnchorClick && globalThis.HTMLAnchorElement?.prototype) globalThis.HTMLAnchorElement.prototype.click = function(){};
-          if (typeof originalCreateObjectURL === 'function') globalThis.URL.createObjectURL = function(blob){ if(blob instanceof Blob && !capturedBlob) capturedBlob=blob; return originalCreateObjectURL.call(this,blob); };
-          button.click();
-          await new Promise((resolve)=>setTimeout(resolve,1600));
-          await Promise.allSettled(capturePromises);
-        } catch {} finally {
-          globalThis.fetch = originalFetch;
-          try { if (typeof originalOpen === 'function') globalThis.open = originalOpen; } catch {}
-          try { if (originalAnchorClick && globalThis.HTMLAnchorElement?.prototype) globalThis.HTMLAnchorElement.prototype.click = originalAnchorClick; } catch {}
-          try { if (typeof originalCreateObjectURL === 'function') globalThis.URL.createObjectURL = originalCreateObjectURL; } catch {}
-        }
-        if (capturedBlob) {
-          let finalBlob = capturedBlob;
-          let finalName = name;
-          if (/json/i.test(capturedBlob.type || '')) {
-            try {
-              const meta = JSON.parse(await capturedBlob.text());
-              if (typeof meta?.download_url === 'string' && /^https:\/\//i.test(meta.download_url)) {
-                const fileResponse = await originalFetch(meta.download_url, { credentials: 'include', cache: 'no-store' });
-                if (fileResponse.ok) {
-                  finalBlob = await fileResponse.blob();
-                  finalName = String(meta.file_name || name || 'download').slice(0,255);
-                  if ((!finalBlob.type || finalBlob.type === 'application/octet-stream') && meta.mime_type) finalBlob = new Blob([await finalBlob.arrayBuffer()], { type: String(meta.mime_type).slice(0,200) });
-                }
-              }
-            } catch {}
-          }
-          await encodeOutputBlob(finalBlob,finalName,'file');
-        }
-      }
-      for (const candidate of outputCandidates.slice(0, 6)) {
-        try {
-          const response = await fetch(candidate.url, { credentials: 'include', cache: 'no-store' });
-          if (!response.ok) continue;
-          const blob = await response.blob();
-          let name = candidate.name || '';
-          if (!name) { try { name = decodeURIComponent(new URL(candidate.url).pathname.split('/').filter(Boolean).at(-1) || 'attachment'); } catch { name = 'attachment'; } }
-          await encodeOutputBlob(blob,name,candidate.kind);
-        } catch {}
-      }
       return {
         ok: true,
         complete: true,
         conversation_id: conversationId,
         assistant_message_id: currentMessageId,
         assistant_text: assistantText,
-        assistant_outputs: assistantOutputs,
         persisted_response_bytes: new TextEncoder().encode(assistantText).length,
         observation_source: "persisted-conversation",
       };
@@ -2083,10 +1976,10 @@ async function pageChatgptRuntimeConversationStart(input) {
   const RUNTIME_READY_TIMEOUT_MS = 20_000;
   const fail = (code, message, details = {}) => ({ ok: false, error: { code, message, ...details } });
   const prompt = String(input?.prompt || "");
+  const model = String(input?.model || "gpt-5-6-pro");
   const thinkingEffort = String(input?.thinkingEffort || "standard");
   const projectId = input?.projectId == null ? null : String(input.projectId);
   const expectedConversationId = input?.conversationId == null ? null : String(input.conversationId);
-  const attachments = Array.isArray(input?.attachments) ? input.attachments.slice(0, 4) : [];
   const promptBytes = new TextEncoder().encode(prompt).length;
 
   if (location.origin !== "https://chatgpt.com") {
@@ -2094,6 +1987,9 @@ async function pageChatgptRuntimeConversationStart(input) {
   }
   if (!prompt || promptBytes > MAX_PROMPT_BYTES) {
     return fail("CHATGPT_PROMPT_INVALID", `The prompt must be between 1 and ${MAX_PROMPT_BYTES} UTF-8 bytes.`);
+  }
+  if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(model)) {
+    return fail("CHATGPT_MODEL_INVALID", "The model id contains unsupported characters.");
   }
   if (!['minimal', 'low', 'standard', 'high', 'max'].includes(thinkingEffort)) {
     return fail("CHATGPT_THINKING_EFFORT_INVALID", "The thinking effort is not supported by this experimental bridge.");
@@ -2104,15 +2000,19 @@ async function pageChatgptRuntimeConversationStart(input) {
   if (expectedConversationId !== null && !/^[A-Za-z0-9_-]{8,128}$/.test(expectedConversationId)) {
     return fail("CHATGPT_CONVERSATION_ID_INVALID", "The existing ChatGPT conversation id is invalid.");
   }
-  const activeThinkingEffort = new URL(location.href).searchParams.get("thinking_effort");
-  // ChatGPT may consume and remove the route query after applying the effort.
-  // A present, conflicting value is authoritative and must fail closed.
-  if (activeThinkingEffort !== null && activeThinkingEffort !== thinkingEffort) {
-    return fail(
-      "CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH",
-      "The signed-in ChatGPT runtime did not activate the requested thinking effort.",
-      { requested_thinking_effort: thinkingEffort, active_thinking_effort: activeThinkingEffort },
-    );
+  if (model === "gpt-5-6-thinking") {
+    const activeThinkingEffort = new URL(location.href).searchParams.get("thinking_effort");
+    // ChatGPT may consume and remove the route query after activating the model.
+    // A present, conflicting value is authoritative and must fail closed; an
+    // absent value is not evidence of a mismatch because the first-party
+    // conversation request below still binds the requested effort explicitly.
+    if (activeThinkingEffort !== null && activeThinkingEffort !== thinkingEffort) {
+      return fail(
+        "CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH",
+        "The signed-in ChatGPT runtime did not activate the requested thinking effort.",
+        { requested_thinking_effort: thinkingEffort, active_thinking_effort: activeThinkingEffort },
+      );
+    }
   }
 
   const findComposerRuntime = () => {
@@ -2168,6 +2068,13 @@ async function pageChatgptRuntimeConversationStart(input) {
 
   const modelContext = modelCandidates[0];
   const currentModelId = modelContext.props.currentModelId;
+  if (currentModelId !== model) {
+    return fail(
+      "CHATGPT_RUNTIME_MODEL_MISMATCH",
+      "The signed-in ChatGPT runtime did not activate the requested model.",
+      { requested_model: model, active_model: currentModelId },
+    );
+  }
   if (projectId !== null && expectedConversationId === null && location.pathname !== `/g/${projectId}/project`) {
     return fail(
       "CHATGPT_RUNTIME_PROJECT_MISMATCH",
@@ -2468,85 +2375,6 @@ async function pageChatgptRuntimeConversationStart(input) {
       endpoint: "/backend-api/f/conversation",
     };
   };
-
-  const attachRemoteFiles = async () => {
-    if (attachments.length === 0) return null;
-    const composerScope = composerRoot.closest?.('form') || composerRoot.parentElement || document;
-    const scopedInputs = [...(composerScope.querySelectorAll?.('input[type="file"]') || [])].filter((input) => !input.disabled);
-    const fallbackInputs = [...document.querySelectorAll('input[type="file"]')].filter((input) => !input.disabled);
-    const fileInputs = scopedInputs.length ? scopedInputs : fallbackInputs;
-    const fileInput = fileInputs.find((input) => /file|image|pdf|document|sheet|presentation|text|\*/i.test(String(input.accept || ""))) || fileInputs[0];
-    if (!fileInput) return fail("CHATGPT_ATTACHMENT_CONTROL_UNAVAILABLE", "ChatGPT's file attachment control is not available in the mounted composer.");
-    if (typeof DataTransfer !== "function" || typeof File !== "function") return fail("CHATGPT_ATTACHMENT_CONTROL_UNAVAILABLE", "The browser runtime does not expose file attachment primitives.");
-    const transfer = new DataTransfer();
-    let totalBytes = 0;
-    for (let index = 0; index < attachments.length; index += 1) {
-      const item = attachments[index] || {};
-      const encoded = String(item.dataBase64 || "");
-      if (!encoded) return fail("CHATGPT_ATTACHMENT_INVALID", `Attachment ${index + 1} has no staged bytes.`);
-      let binary;
-      try { binary = atob(encoded); } catch { return fail("CHATGPT_ATTACHMENT_INVALID", `Attachment ${index + 1} has invalid staged bytes.`); }
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-      totalBytes += bytes.length;
-      if (bytes.length > 16 * 1024 * 1024 || totalBytes > 24 * 1024 * 1024) return fail("CHATGPT_ATTACHMENT_TOO_LARGE", "The attachment set exceeds the browser staging limit.");
-      const name = String(item.name || `attachment-${index + 1}`).replace(/[\/\\\0]/g, "_").slice(0, 255);
-      const type = String(item.mimeType || "application/octet-stream").slice(0, 200);
-      transfer.items.add(new File([bytes], name, { type, lastModified: Date.now() }));
-    }
-    try { fileInput.files = transfer.files; } catch {
-      try { Object.defineProperty(fileInput, "files", { value: transfer.files, configurable: true }); } catch { return fail("CHATGPT_ATTACHMENT_CONTROL_UNAVAILABLE", "ChatGPT's attachment input rejected the selected files."); }
-    }
-    const beforeImageCount = composerScope.querySelectorAll?.('img').length || 0;
-    const beforeAttachmentCount = composerScope.querySelectorAll?.('[data-testid*="attachment"], [data-testid*="file"]')?.length || 0;
-    let changeHandled = false;
-    try {
-      const propsKey = Object.keys(fileInput).find((key)=>key.startsWith('__reactProps$'));
-      const reactProps = propsKey ? fileInput[propsKey] : null;
-      if (typeof reactProps?.onChange === 'function') {
-        const result = reactProps.onChange({
-          type:'change', target:fileInput, currentTarget:fileInput,
-          preventDefault(){}, stopPropagation(){}, persist(){},
-          nativeEvent:{ type:'change', target:fileInput },
-        });
-        if (result && typeof result.then === 'function') await result;
-        changeHandled = true;
-      }
-    } catch {}
-    if (!changeHandled) {
-      fileInput.dispatchEvent(new Event("input", { bubbles: true }));
-      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-    const uploadDeadline = Date.now() + 30_000;
-    let mounted = false;
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    while (Date.now() < uploadDeadline) {
-      const obviousFailure = [...document.querySelectorAll('[role="alert"], [data-testid*="error"]')].some((node) => /upload|file|attachment/i.test(String(node.innerText || node.textContent || "")));
-      if (obviousFailure) return fail("CHATGPT_ATTACHMENT_UPLOAD_FAILED", "ChatGPT reported an attachment upload error.");
-      const scopeText = String(composerScope.innerText || composerScope.textContent || "");
-      const imageCount = composerScope.querySelectorAll?.('img').length || 0;
-      const attachmentCount = composerScope.querySelectorAll?.('[data-testid*="attachment"], [data-testid*="file"]')?.length || 0;
-      mounted = attachments.some((item)=>scopeText.includes(String(item.name||''))) || imageCount > beforeImageCount || attachmentCount > beforeAttachmentCount;
-      const pending = [...composerScope.querySelectorAll?.('[aria-busy="true"], [data-testid*="upload"]') || []].some((node) => {
-        const text = String(node.innerText || node.textContent || "");
-        return /uploading|processing/i.test(text) || node.getAttribute("aria-busy") === "true";
-      });
-      if (mounted && !pending) break;
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    if (!mounted) return fail("CHATGPT_ATTACHMENT_NOT_MOUNTED", "ChatGPT did not mount the staged attachment in the active composer; no submission was attempted.");
-    return null;
-  };
-
-  let attachmentFailure = null;
-  try { attachmentFailure = await attachRemoteFiles(); }
-  catch (error) {
-    return fail("CHATGPT_ATTACHMENT_RUNTIME_ERROR", "ChatGPT attachment preparation failed inside the signed-in page runtime.", {
-      error_name: String(error?.name || "Error").slice(0,100),
-      error_message: String(error?.message || error || "").slice(0,500),
-    });
-  }
-  if (attachmentFailure) return attachmentFailure;
 
   const originalFetch = globalThis.fetch;
   let observedConversationRequest = false;
@@ -3419,13 +3247,7 @@ async function executeInTab(tabId, func, args, world = "ISOLATED") {
     func,
     args,
   });
-  const first = result?.[0] || null;
-  if (first?.error) {
-    const error = new Error(first.error.message || "Injected page function failed.");
-    error.code = "CHROME_PAGE_EXECUTION_FAILED";
-    throw error;
-  }
-  return first?.result ?? null;
+  return result?.[0]?.result ?? null;
 }
 
 async function dispatch(message) {
@@ -3583,27 +3405,13 @@ async function dispatch(message) {
       let autoLeased = false;
       if (args.tabId !== undefined && args.tabId !== null) {
         tab = await getApprovedTab(args.tabId, compiled);
-        if (transport === "runtime") {
-          const route = projectId !== null && conversationId === null
-            ? `/g/${encodeURIComponent(projectId)}/project`
-            : conversationId === null
-              ? "/"
-              : `/c/${encodeURIComponent(conversationId)}`;
-          const query = new URLSearchParams({ thinking_effort: thinkingEffort });
-          const targetUrl = `https://chatgpt.com${route}?${query}`;
-          const previousUrl = String(tab.url || "");
-          if (previousUrl !== targetUrl) {
-            await chrome.tabs.update(tab.id, { url: targetUrl, active: false });
-            tab = await waitForApprovedNavigation(tab.id, compiled, { previousUrl, requestedUrl: targetUrl });
-          }
-        }
       } else if (transport === "runtime") {
         const route = projectId !== null && conversationId === null
           ? `/g/${encodeURIComponent(projectId)}/project`
           : conversationId === null
             ? "/"
             : `/c/${encodeURIComponent(conversationId)}`;
-        const query = new URLSearchParams({ thinking_effort: thinkingEffort });
+        const query = new URLSearchParams({ model, thinking_effort: thinkingEffort });
         const targetUrl = `https://chatgpt.com${route}?${query}`;
         const leased = await leaseWorkspaceTab(targetUrl, compiled);
         tab = await readTab(leased.tabId);
@@ -3631,40 +3439,14 @@ async function dispatch(message) {
         const pageFunction = transport === "runtime"
           ? pageChatgptRuntimeConversationStart
           : pageChatgptConversationStart;
-        const stagedAttachments = [];
-        if (transport === "runtime" && Array.isArray(args.attachments) && args.attachments.length) {
-          let totalAttachmentBytes = 0;
-          for (let index = 0; index < args.attachments.slice(0,4).length; index += 1) {
-            const item = args.attachments[index] || {};
-            let url;
-            try { url = new URL(String(item.url || "")); } catch {
-              const error = new Error(`Attachment ${index + 1} URL is invalid.`); error.code = "CHATGPT_ATTACHMENT_INVALID"; throw error;
-            }
-            if (url.protocol !== "https:") { const error = new Error(`Attachment ${index + 1} must use HTTPS.`); error.code = "CHATGPT_ATTACHMENT_INVALID"; throw error; }
-            const response = await fetch(url.href, { credentials: "omit", cache: "no-store", headers: { "User-Agent": "Mozilla/5.0" } });
-            if (!response.ok) { const error = new Error(`Attachment ${index + 1} download failed (${response.status}).`); error.code = "CHATGPT_ATTACHMENT_DOWNLOAD_FAILED"; throw error; }
-            const bytes = new Uint8Array(await response.arrayBuffer());
-            totalAttachmentBytes += bytes.length;
-            if (bytes.length > 16 * 1024 * 1024 || totalAttachmentBytes > 24 * 1024 * 1024) { const error = new Error("Attachment set exceeds the 24 MB browser staging limit."); error.code = "CHATGPT_ATTACHMENT_TOO_LARGE"; throw error; }
-            let binary = "";
-            for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
-            stagedAttachments.push({
-              name: String(item.name || `attachment-${index + 1}`).slice(0,255),
-              mimeType: String(item.mimeType || response.headers.get("content-type") || "application/octet-stream").slice(0,200),
-              size: bytes.length,
-              dataBase64: btoa(binary),
-            });
-          }
-        }
         const pageArguments = [{
           prompt: String(args.prompt || ""),
-          ...(transport === "raw" ? { model } : {}),
+          model,
           thinkingEffort,
           maxRuntimeSeconds: Math.max(30, Math.min(3600, Number(args.maxRuntimeSeconds || 600))),
           continueInWork: args.continueInWork !== false,
           ...(projectId === null ? {} : { projectId }),
           ...(conversationId === null ? {} : { conversationId }),
-          ...(stagedAttachments.length ? { attachments: stagedAttachments } : {}),
         }];
         const modelReadyDeadline = Date.now() + 20_000;
         let result;
@@ -3672,7 +3454,7 @@ async function dispatch(message) {
           result = await executeInTab(tab.id, pageFunction, pageArguments, "MAIN");
           if (
             transport !== "runtime" ||
-            !["CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH", "CHATGPT_RUNTIME_NOT_READY"].includes(result?.error?.code) ||
+            !["CHATGPT_RUNTIME_MODEL_MISMATCH", "CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH", "CHATGPT_RUNTIME_NOT_READY"].includes(result?.error?.code) ||
             Date.now() >= modelReadyDeadline
           ) break;
           await new Promise((resolve) => setTimeout(resolve, 250));
@@ -3706,7 +3488,6 @@ async function dispatch(message) {
             ...result,
             assistant_message_id: persisted.assistant_message_id || result.assistant_message_id || null,
             assistant_text: persisted.assistant_text,
-            assistant_outputs: Array.isArray(persisted.assistant_outputs) ? persisted.assistant_outputs : [],
             persisted_response_bytes: persisted.persisted_response_bytes,
             observation_source: persisted.observation_source,
           };

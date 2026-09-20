@@ -751,22 +751,13 @@ const TOOLS = [
       properties: {
         prompt: { type: "string", minLength: 1, maxLength: 4000000, description: "Prompt for the new ChatGPT conversation. Audit logs retain only byte length and a hash prefix." },
         transport: { type: "string", enum: ["runtime", "raw"], default: "runtime", description: "Use ChatGPT's first-party runtime by default. raw retains the direct private-request path only for diagnostics." },
-        model: { type: "string", minLength: 1, maxLength: 128, description: "Deprecated compatibility input. Runtime transport ignores this value and uses ChatGPT's signed-in default/best model; raw diagnostics may still use it." },
+        model: { type: "string", minLength: 1, maxLength: 128, default: "gpt-5-6-pro", description: "ChatGPT web model slug to activate in the leased background tab." },
         thinking_effort: { type: "string", enum: ["minimal", "low", "standard", "high", "max"], default: "standard" },
         max_runtime_seconds: { type: "integer", minimum: 30, maximum: 3600, default: 600, description: "Maximum time to wait for this ChatGPT turn, including MDB tool use. Long-running agents may request up to one hour." },
         continue_in_work: { type: "boolean", default: true, description: "Raw diagnostic mode only: advertise ChatGPT's local.continue_in_work function to the private request." },
         project_id: { type: "string", pattern: "^g-p-[A-Za-z0-9_-]{8,128}$", description: "Optional exact ChatGPT Project id. New runtime conversations are submitted only after the Project route and mounted composer state both match it." },
         conversation_id: { type: "string", pattern: "^[A-Za-z0-9_-]{8,128}$", description: "Optional exact existing ChatGPT conversation id. When supplied in runtime mode, MDB opens that conversation in an allocated background tab and continues it once." },
         tab_id: { type: "integer", minimum: 0, description: "Optional existing leased chatgpt.com Chrome tab id. When omitted, runtime mode leases and releases an MDB background tab automatically." },
-        attachments: {
-          type: "array", maxItems: 4, description: "Optional HTTPS-backed files to attach through ChatGPT's signed-in composer. Intended for short-lived source URLs such as Discord CDN attachments.",
-          items: { type: "object", additionalProperties: false, required: ["url","name"], properties: {
-            url: { type: "string", minLength: 1, maxLength: 4000 },
-            name: { type: "string", minLength: 1, maxLength: 255 },
-            mime_type: { type: "string", maxLength: 200 },
-            size: { type: "integer", minimum: 0, maximum: 52428800 },
-          } },
-        },
       },
       required: ["prompt"],
       additionalProperties: false,
@@ -3127,7 +3118,7 @@ async function dispatchTool(name, args) {
         error.code = "CHATGPT_SECURITY_FIELDS_REFUSED";
         throw error;
       }
-      const allowed = new Set(["prompt", "transport", "model", "thinking_effort", "max_runtime_seconds", "continue_in_work", "project_id", "conversation_id", "tab_id", "attachments"]);
+      const allowed = new Set(["prompt", "transport", "model", "thinking_effort", "max_runtime_seconds", "continue_in_work", "project_id", "conversation_id", "tab_id"]);
       const unknown = keys.filter((key) => !allowed.has(key));
       if (unknown.length > 0) throw new Error(`Unknown chatgpt_conversation_start argument(s): ${unknown.join(", ")}`);
 
@@ -3140,7 +3131,8 @@ async function dispatchTool(name, args) {
         error.code = "CHATGPT_TRANSPORT_INVALID";
         throw error;
       }
-      const requestedModel = args.model === undefined || args.model === null ? undefined : requireString(args, "model");
+      const model = optionalString(args, "model", "gpt-5-6-pro");
+      if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(model)) throw new Error("'model' contains unsupported characters");
       const thinkingEffort = optionalString(args, "thinking_effort", "standard");
       if (!["minimal", "low", "standard", "high", "max"].includes(thinkingEffort)) {
         throw new Error("'thinking_effort' must be minimal, low, standard, high, or max");
@@ -3171,34 +3163,16 @@ async function dispatchTool(name, args) {
       const tabId = args.tab_id === undefined || args.tab_id === null
         ? undefined
         : requireInteger(args, "tab_id", 0, 2_147_483_647);
-      const attachments = args.attachments === undefined ? [] : args.attachments;
-      if (!Array.isArray(attachments) || attachments.length > 4) throw new Error("'attachments' must be an array with at most 4 items");
-      let totalAttachmentBytes = 0;
-      const normalizedAttachments = attachments.map((item, index) => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`attachments[${index}] must be an object`);
-        const url = String(item.url || "");
-        let parsed; try { parsed = new URL(url); } catch { throw new Error(`attachments[${index}].url must be a valid HTTPS URL`); }
-        if (parsed.protocol !== "https:") throw new Error(`attachments[${index}].url must use HTTPS`);
-        const name = String(item.name || "").trim();
-        if (!name || name.length > 255 || /[\/\\\0]/.test(name)) throw new Error(`attachments[${index}].name is invalid`);
-        const mimeType = item.mime_type == null ? "" : String(item.mime_type).slice(0, 200);
-        const size = item.size == null ? 0 : Number(item.size);
-        if (!Number.isInteger(size) || size < 0 || size > 52_428_800) throw new Error(`attachments[${index}].size is invalid`);
-        totalAttachmentBytes += size;
-        return { url, name, mimeType, size };
-      });
-      if (totalAttachmentBytes > 80 * 1024 * 1024) throw new Error("attachments total declared size exceeds 80 MB");
       return await callBackgroundChrome(name, "tabs.chatgptConversationStart", {
         prompt,
         transport,
-        ...(transport === "raw" ? { model: requestedModel || "gpt-5-6-pro" } : {}),
+        model,
         thinkingEffort,
         maxRuntimeSeconds,
         continueInWork,
         ...(projectId === undefined ? {} : { projectId }),
         ...(conversationId === undefined ? {} : { conversationId }),
         ...(tabId === undefined ? {} : { tabId }),
-        ...(normalizedAttachments.length ? { attachments: normalizedAttachments } : {}),
       }, { timeoutMs: maxRuntimeSeconds * 1000 + 120_000 });
     }
 
