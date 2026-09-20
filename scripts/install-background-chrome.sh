@@ -57,7 +57,6 @@ chmod 600 "$PROFILE_BINDING"
 umask 077
 cat > "$WRAPPER" <<EOF2
 #!/bin/sh
-export MAC_DEV_BRIDGE_DATA_DIR="$DATA_DIR"
 exec "$NODE_BIN" "$ROOT/scripts/chrome-native-host.mjs"
 EOF2
 chmod 700 "$WRAPPER"
