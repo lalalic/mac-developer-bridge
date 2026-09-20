@@ -2083,6 +2083,7 @@ async function pageChatgptRuntimeConversationStart(input) {
   const RUNTIME_READY_TIMEOUT_MS = 20_000;
   const fail = (code, message, details = {}) => ({ ok: false, error: { code, message, ...details } });
   const prompt = String(input?.prompt || "");
+  const model = String(input?.model || "gpt-5-6-pro");
   const thinkingEffort = String(input?.thinkingEffort || "standard");
   const projectId = input?.projectId == null ? null : String(input.projectId);
   const expectedConversationId = input?.conversationId == null ? null : String(input.conversationId);
@@ -2095,6 +2096,9 @@ async function pageChatgptRuntimeConversationStart(input) {
   if (!prompt || promptBytes > MAX_PROMPT_BYTES) {
     return fail("CHATGPT_PROMPT_INVALID", `The prompt must be between 1 and ${MAX_PROMPT_BYTES} UTF-8 bytes.`);
   }
+  if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(model)) {
+    return fail("CHATGPT_MODEL_INVALID", "The model id contains unsupported characters.");
+  }
   if (!['minimal', 'low', 'standard', 'high', 'max'].includes(thinkingEffort)) {
     return fail("CHATGPT_THINKING_EFFORT_INVALID", "The thinking effort is not supported by this experimental bridge.");
   }
@@ -2104,15 +2108,19 @@ async function pageChatgptRuntimeConversationStart(input) {
   if (expectedConversationId !== null && !/^[A-Za-z0-9_-]{8,128}$/.test(expectedConversationId)) {
     return fail("CHATGPT_CONVERSATION_ID_INVALID", "The existing ChatGPT conversation id is invalid.");
   }
-  const activeThinkingEffort = new URL(location.href).searchParams.get("thinking_effort");
-  // ChatGPT may consume and remove the route query after applying the effort.
-  // A present, conflicting value is authoritative and must fail closed.
-  if (activeThinkingEffort !== null && activeThinkingEffort !== thinkingEffort) {
-    return fail(
-      "CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH",
-      "The signed-in ChatGPT runtime did not activate the requested thinking effort.",
-      { requested_thinking_effort: thinkingEffort, active_thinking_effort: activeThinkingEffort },
-    );
+  if (model === "gpt-5-6-thinking") {
+    const activeThinkingEffort = new URL(location.href).searchParams.get("thinking_effort");
+    // ChatGPT may consume and remove the route query after activating the model.
+    // A present, conflicting value is authoritative and must fail closed; an
+    // absent value is not evidence of a mismatch because the first-party
+    // conversation request below still binds the requested effort explicitly.
+    if (activeThinkingEffort !== null && activeThinkingEffort !== thinkingEffort) {
+      return fail(
+        "CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH",
+        "The signed-in ChatGPT runtime did not activate the requested thinking effort.",
+        { requested_thinking_effort: thinkingEffort, active_thinking_effort: activeThinkingEffort },
+      );
+    }
   }
 
   const findComposerRuntime = () => {
@@ -2168,6 +2176,13 @@ async function pageChatgptRuntimeConversationStart(input) {
 
   const modelContext = modelCandidates[0];
   const currentModelId = modelContext.props.currentModelId;
+  if (currentModelId !== model) {
+    return fail(
+      "CHATGPT_RUNTIME_MODEL_MISMATCH",
+      "The signed-in ChatGPT runtime did not activate the requested model.",
+      { requested_model: model, active_model: currentModelId },
+    );
+  }
   if (projectId !== null && expectedConversationId === null && location.pathname !== `/g/${projectId}/project`) {
     return fail(
       "CHATGPT_RUNTIME_PROJECT_MISMATCH",
@@ -3589,7 +3604,7 @@ async function dispatch(message) {
             : conversationId === null
               ? "/"
               : `/c/${encodeURIComponent(conversationId)}`;
-          const query = new URLSearchParams({ thinking_effort: thinkingEffort });
+          const query = new URLSearchParams({ model, thinking_effort: thinkingEffort });
           const targetUrl = `https://chatgpt.com${route}?${query}`;
           const previousUrl = String(tab.url || "");
           if (previousUrl !== targetUrl) {
@@ -3603,7 +3618,7 @@ async function dispatch(message) {
           : conversationId === null
             ? "/"
             : `/c/${encodeURIComponent(conversationId)}`;
-        const query = new URLSearchParams({ thinking_effort: thinkingEffort });
+        const query = new URLSearchParams({ model, thinking_effort: thinkingEffort });
         const targetUrl = `https://chatgpt.com${route}?${query}`;
         const leased = await leaseWorkspaceTab(targetUrl, compiled);
         tab = await readTab(leased.tabId);
@@ -3658,7 +3673,7 @@ async function dispatch(message) {
         }
         const pageArguments = [{
           prompt: String(args.prompt || ""),
-          ...(transport === "raw" ? { model } : {}),
+          model,
           thinkingEffort,
           maxRuntimeSeconds: Math.max(30, Math.min(3600, Number(args.maxRuntimeSeconds || 600))),
           continueInWork: args.continueInWork !== false,
@@ -3672,7 +3687,7 @@ async function dispatch(message) {
           result = await executeInTab(tab.id, pageFunction, pageArguments, "MAIN");
           if (
             transport !== "runtime" ||
-            !["CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH", "CHATGPT_RUNTIME_NOT_READY"].includes(result?.error?.code) ||
+            !["CHATGPT_RUNTIME_MODEL_MISMATCH", "CHATGPT_RUNTIME_THINKING_EFFORT_MISMATCH", "CHATGPT_RUNTIME_NOT_READY"].includes(result?.error?.code) ||
             Date.now() >= modelReadyDeadline
           ) break;
           await new Promise((resolve) => setTimeout(resolve, 250));

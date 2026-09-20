@@ -301,7 +301,7 @@ try {
   });
   assert.equal(solReply.status, 200);
   assert.equal((await solReply.json()).model, "chatgpt-sol");
-  assert.equal(browserCalls.at(-1).args.model, undefined);
+  assert.equal(browserCalls.at(-1).args.model, "gpt-5-6-thinking");
   assert.equal(browserCalls.at(-1).args.thinkingEffort, "max");
   assert.equal(browserCalls.at(-1).args.projectId, chatgptProjectId);
   ok("Responses Sol model maps reasoning effort and binds the configured Project");

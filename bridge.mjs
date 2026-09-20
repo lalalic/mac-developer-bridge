@@ -751,7 +751,7 @@ const TOOLS = [
       properties: {
         prompt: { type: "string", minLength: 1, maxLength: 4000000, description: "Prompt for the new ChatGPT conversation. Audit logs retain only byte length and a hash prefix." },
         transport: { type: "string", enum: ["runtime", "raw"], default: "runtime", description: "Use ChatGPT's first-party runtime by default. raw retains the direct private-request path only for diagnostics." },
-        model: { type: "string", minLength: 1, maxLength: 128, description: "Deprecated compatibility input. Runtime transport ignores this value and uses ChatGPT's signed-in default/best model; raw diagnostics may still use it." },
+        model: { type: "string", minLength: 1, maxLength: 128, default: "gpt-5-6-pro", description: "ChatGPT web model slug to activate in the leased background tab." },
         thinking_effort: { type: "string", enum: ["minimal", "low", "standard", "high", "max"], default: "standard" },
         max_runtime_seconds: { type: "integer", minimum: 30, maximum: 3600, default: 600, description: "Maximum time to wait for this ChatGPT turn, including MDB tool use. Long-running agents may request up to one hour." },
         continue_in_work: { type: "boolean", default: true, description: "Raw diagnostic mode only: advertise ChatGPT's local.continue_in_work function to the private request." },
@@ -3140,7 +3140,8 @@ async function dispatchTool(name, args) {
         error.code = "CHATGPT_TRANSPORT_INVALID";
         throw error;
       }
-      const requestedModel = args.model === undefined || args.model === null ? undefined : requireString(args, "model");
+      const model = optionalString(args, "model", "gpt-5-6-pro");
+      if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(model)) throw new Error("'model' contains unsupported characters");
       const thinkingEffort = optionalString(args, "thinking_effort", "standard");
       if (!["minimal", "low", "standard", "high", "max"].includes(thinkingEffort)) {
         throw new Error("'thinking_effort' must be minimal, low, standard, high, or max");
@@ -3191,7 +3192,7 @@ async function dispatchTool(name, args) {
       return await callBackgroundChrome(name, "tabs.chatgptConversationStart", {
         prompt,
         transport,
-        ...(transport === "raw" ? { model: requestedModel || "gpt-5-6-pro" } : {}),
+        model,
         thinkingEffort,
         maxRuntimeSeconds,
         continueInWork,
