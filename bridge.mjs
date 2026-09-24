@@ -2230,7 +2230,9 @@ const federationReady = federation.start().then(() => {
 // one of the two would be unreachable in one direction and unguarded in the other.
 function advertisedTools() {
   let base = ptyAvailable ? TOOLS : TOOLS.filter((tool) => !tool.name.startsWith("pty_"));
-  if (process.platform !== "darwin") base = base.filter((tool) => !tool.name.startsWith("chrome_") && !tool.name.startsWith("chatgpt_"));
+  if (process.env.MAC_DEV_BRIDGE_ENABLE_LEGACY_BROWSER_TOOLS !== "1") {
+    base = base.filter((tool) => !tool.name.startsWith("chrome_") && !tool.name.startsWith("chatgpt_"));
+  }
   const federated = federation.listTools();
   return federated.length === 0 ? base : base.concat(federated);
 }
@@ -3246,7 +3248,7 @@ async function dispatchTool(name, args) {
       const cwd = optionalString(args, "cwd", HOME);
       const chromeRoutingRisk = chromeBackgroundRoutingRisk(command);
       if (chromeRoutingRisk) {
-        const error = new Error(`Direct Chrome GUI automation is blocked (${chromeRoutingRisk.reason}). Chrome web work must use the built-in chrome_* tools and the MDB tab group so it stays in the signed-in profile without stealing focus. This routing rule applies in both Relaxed and Strict approval modes.`);
+        const error = new Error(`Direct Chrome GUI automation is blocked (${chromeRoutingRisk.reason}). Chrome web work must use the browser-harness workflow instead of direct Chrome automation through DevMacBridge. This routing rule applies in both Relaxed and Strict approval modes.`);
         error.code = "CHROME_BACKGROUND_REQUIRED";
         await audit(name, args, { blocked: true, chromeBackgroundRequired: true, chromeRoutingRisk }, error);
         throw error;
@@ -3281,7 +3283,7 @@ async function dispatchTool(name, args) {
       const command = requireString(args, "command");
       const chromeRoutingRisk = chromeBackgroundRoutingRisk(command);
       if (chromeRoutingRisk) {
-        const error = new Error(`Direct Chrome GUI automation is blocked (${chromeRoutingRisk.reason}). Chrome web work must use the built-in chrome_* tools and the MDB tab group so it stays in the signed-in profile without stealing focus. This routing rule applies in both Relaxed and Strict approval modes.`);
+        const error = new Error(`Direct Chrome GUI automation is blocked (${chromeRoutingRisk.reason}). Chrome web work must use the browser-harness workflow instead of direct Chrome automation through DevMacBridge. This routing rule applies in both Relaxed and Strict approval modes.`);
         error.code = "CHROME_BACKGROUND_REQUIRED";
         await audit(name, args, { blocked: true, chromeBackgroundRequired: true, chromeRoutingRisk }, error);
         throw error;
@@ -4000,7 +4002,7 @@ async function handleMessage(message) {
       resultType: "complete",
       supportedVersions: [MODERN_PROTOCOL, "2025-11-25", "2025-06-18"],
       capabilities: { tools: { listChanged: true }, resources: { listChanged: false, subscribe: false } },
-      instructions: "This bridge has unrestricted access under the host macOS user. Prefer codex_thread_read over invoking Codex model turns. Use shell_start for long-running commands. Relaxed access is the default: routine HTTP/HTTPS work through the signed-in MDB Chrome workspace and non-Chrome foreground desktop-app control do not require per-site/per-app approval files. Direct Chrome AppleScript/JXA, direct Chrome executable launches, and shell web-open commands are always blocked in both Relaxed and Strict modes; Chrome web work must use the chrome_* MDB background tools. Prefer background browser/API paths so the operator keeps focus. If the operator enables Strict approvals in the menu-bar app, scoped browser and non-Chrome foreground-app approvals are required until they turn it off. Do not print secrets unless the user explicitly requests them.",
+      instructions: "This bridge has unrestricted access under the host macOS user. Prefer codex_thread_read over invoking Codex model turns. Use shell_start for long-running commands. Relaxed access is the default: routine HTTP/HTTPS work through the signed-in MDB Chrome workspace and non-Chrome foreground desktop-app control do not require per-site/per-app approval files. Direct Chrome AppleScript/JXA, direct Chrome executable launches, and shell web-open commands are always blocked in both Relaxed and Strict modes; Chrome web work must use the browser-harness workflow. Prefer background browser/API paths so the operator keeps focus. If the operator enables Strict approvals in the menu-bar app, scoped browser and non-Chrome foreground-app approvals are required until they turn it off. Do not print secrets unless the user explicitly requests them.",
       ttlMs: 3_600_000,
       cacheScope: "private",
       _meta: resultMeta(),
@@ -4019,7 +4021,7 @@ async function handleMessage(message) {
       protocolVersion: negotiatedProtocol,
       capabilities: { tools: { listChanged: true }, resources: { listChanged: false, subscribe: false } },
       serverInfo: serverInfo(),
-      instructions: "This bridge runs without a filesystem sandbox or command allowlist. Effective permissions equal the macOS user running it. Prefer codex_thread_read for persisted Codex history without model usage. On macOS, use the MDB chrome_* background workspace for normal logged-in web work and prefer APIs/connectors over native UI automation. Direct Chrome AppleScript/JXA, direct Chrome executable launches, and shell web-open commands are always refused so Chrome cannot bypass the MDB group or steal focus. Relaxed access is the default and removes approval ceremony; Strict approvals is an operator-controlled optional mode for URL scopes and non-Chrome foreground apps.",
+      instructions: "This bridge runs without a filesystem sandbox or command allowlist. Effective permissions equal the macOS user running it. Prefer codex_thread_read for persisted Codex history without model usage. Use the browser-harness workflow for browser interaction and prefer APIs/connectors over native UI automation. Direct Chrome AppleScript/JXA, direct Chrome executable launches, and shell web-open commands are always refused so Chrome cannot bypass the MDB group or steal focus. Relaxed access is the default and removes approval ceremony; Strict approvals is an operator-controlled optional mode for URL scopes and non-Chrome foreground apps.",
     });
     return;
   }
