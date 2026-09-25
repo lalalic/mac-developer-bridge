@@ -14,6 +14,10 @@ fi
 
 ROOT="${MAC_DEV_BRIDGE_PACKAGE_DIR:-${0:A:h:h}}"
 CONFIG="$ROOT/scripts/mdb-pm2.config.cjs"
+SKILL_STATE="${ROOT:h}/.state"
+if [[ -z "${MAC_DEV_BRIDGE_MCP_SERVERS_FILE:-}" && -f "$SKILL_STATE/mcp-servers.json" ]]; then
+  export MAC_DEV_BRIDGE_MCP_SERVERS_FILE="$SKILL_STATE/mcp-servers.json"
+fi
 DATA_DIR="${MAC_DEV_BRIDGE_DATA_DIR:-$HOME/Library/Application Support/MacDeveloperBridge}"
 LOG_DIR="${MAC_DEV_BRIDGE_LOG_DIR:-$HOME/Library/Logs/MacDeveloperBridge}"
 PUBLIC_URL_FILE="$DATA_DIR/public-url"
