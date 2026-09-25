@@ -756,3 +756,25 @@ It does **not** remove the data directory, so these survive an uninstall — inc
 - `oauth-client-id`, `mcp-http.pid`, `cloudflared.pid`, `jobs/`, and the audit log
 
 Delete `~/Library/Application Support/MacDeveloperBridge` as well if you want the credentials gone. It also does not stop a running front end; run `scripts/disable.sh` first.
+
+## Mac node bootstrap
+
+Remote Macs can join this bridge as named federation nodes using `scripts/mac-node-server.py` and `scripts/bootstrap-mac-node.sh`. Each node runs the same seven basic Mac tools locally and creates a reverse SSH tunnel back to a dedicated loopback port on the hub. The hub registers that port in `mcp-servers.json`.
+
+Naming is intentionally node-specific: a provider key names one physical/logical Mac. For example, provider `home98` produces tools such as `home98__shell_exec` and `home98__fs_read`. In bootstrap instructions, `xxxnode_*` means **tools for that specific node**, not shared/global Mac tools. Use stable logical names such as `work`, `home98`, or `build-mac`; do not encode transient IP addresses into tool behavior.
+
+Example per-node config:
+
+```sh
+NODE_NAME=home98
+HUB_SSH_TARGET=chengli@10.0.0.111
+HUB_MCP_PORT=28798
+LOCAL_MCP_PORT=8789
+```
+
+Install the persistent user LaunchAgent with:
+
+```sh
+~/.local/share/neo-node/bootstrap-mac-node.sh install
+```
+
