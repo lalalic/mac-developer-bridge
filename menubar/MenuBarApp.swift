@@ -1,13 +1,10 @@
 // Menu bar controller for Mac Developer Bridge (Cloudflare/HTTP transport).
 //
-// It owns the lifecycle of the two processes the transport needs — mcp-http.mjs
-// and `cloudflared tunnel` — and surfaces the three things you actually need:
-// the public URL, the bearer token, and whether the endpoint is answering.
-//
-// Owning the lifecycle is the point. The scripted kill switch has to discover
-// processes it did not start, which is where its bugs came from; this app knows
-// its own children. "Stop" also removes the unlock file, so bridge.mjs's
-// per-call latch refuses anything already in flight.
+// It owns the bridge lifecycle and macOS security/privacy context. Long-running
+// transport services are supervised by PM2 through scripts/runtime-start.sh, while
+// this app owns the unlock latch, settings, public URL, and health/status UI.
+// "Stop" removes the unlock file first, so bridge.mjs's per-call latch refuses
+// anything already in flight before PM2 tears down the transport services.
 
 import AppKit
 
@@ -100,6 +97,7 @@ struct Paths {
 
     static var tokenFile: String { dataDir + "/http-token" }
     static var tunnelPidFile: String { dataDir + "/cloudflared.pid" }
+    static var publicURLFile: String { dataDir + "/public-url" }
     static var clientIdFile: String { dataDir + "/oauth-client-id" }
     static var unlockFile: String { dataDir + "/FULL_ACCESS_ENABLED" }
     static var settingsFile: String { dataDir + "/settings.json" }
@@ -328,10 +326,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
 
-    private var httpProcess: Process?
-    private var tunnelProcess: Process?
     private var runtimeStartProcess: Process?
-    private var tunnelReader: FileHandle?
 
     private var token = ""
     private var publicURL: String?
@@ -346,8 +341,6 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// issuer can be PINNED to the public origin rather than derived from the Host
     /// header on each request. Host is client-controllable; a pinned issuer cannot be
     /// steered by a crafted request into advertising someone else's endpoints.
-    private var pendingFrontEndLaunch = false
-    private var startGeneration = 0
 
     // Menu items kept as properties so polling can retitle them in place.
     private let statusMenuItem = NSMenuItem(title: "Stopped", action: nil, keyEquivalent: "")
@@ -493,9 +486,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         // This app is the service owner. Launching it should restore the bridge without
         // requiring a menu click (important for Login Items and reboot recovery).
         DispatchQueue.main.async { [weak self] in
-            self?.startRuntimeScript()
-            self?.startBridge()
-            self?.render()
+            self?.startRuntimeScript { [weak self] in
+                self?.startBridge()
+                self?.render()
+            }
         }
     }
 
@@ -755,17 +749,14 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// started by the script (for example a PM2 daemon) are machine runtime services,
     /// not transport children. The script is a normal editable file so adding or
     /// removing services never requires rebuilding this Swift app.
-    private func startRuntimeScript() {
+    private func startRuntimeScript(completion: (() -> Void)? = nil) {
         let script = Paths.runtimeStartScript
-        guard FileManager.default.fileExists(atPath: script) else { return }
-
-        try? FileManager.default.createDirectory(atPath: Paths.logDir,
-                                                withIntermediateDirectories: true,
+        guard FileManager.default.fileExists(atPath: script) else { completion?(); return }
+        try? FileManager.default.createDirectory(atPath: Paths.logDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = [script]
+        process.arguments = [script, "bootstrap"]
         process.currentDirectoryURL = URL(fileURLWithPath: Paths.packageDir)
         process.environment = childEnvironment(publicURL: nil)
         process.standardOutput = appendHandle(Paths.runtimeStartLog)
@@ -773,9 +764,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         process.terminationHandler = { [weak self] finished in
             NSLog("MacDevBridge: runtime start script exited with status %d", finished.terminationStatus)
             DispatchQueue.main.async {
-                if self?.runtimeStartProcess === finished {
-                    self?.runtimeStartProcess = nil
-                }
+                if self?.runtimeStartProcess === finished { self?.runtimeStartProcess = nil }
+                completion?()
             }
         }
         do {
@@ -783,35 +773,16 @@ final class Controller: NSObject, NSApplicationDelegate {
             runtimeStartProcess = process
         } catch {
             NSLog("MacDevBridge: could not start runtime script %@: %@", script, error.localizedDescription)
+            completion?()
         }
     }
 
     private func startBridge() {
-        guard nodePath != nil else {
-            state = .failed("node not found on the login shell PATH")
-            return
-        }
-        guard FileManager.default.fileExists(atPath: Paths.frontEnd) else {
-            state = .failed("mcp-http.mjs not found next to the app")
-            return
-        }
-        guard !token.isEmpty else {
-            state = .failed("no token")
-            return
-        }
-        guard let cf = cloudflaredPath else {
-            state = .failed("cloudflared not found on the login shell PATH")
-            return
-        }
+        guard nodePath != nil else { state = .failed("node not found on the login shell PATH"); return }
+        guard FileManager.default.fileExists(atPath: Paths.frontEnd) else { state = .failed("mcp-http.mjs not found next to the app"); return }
+        guard !token.isEmpty else { state = .failed("no token"); return }
+        guard cloudflaredPath != nil else { state = .failed("cloudflared not found on the login shell PATH"); return }
 
-        stopBridge()
-        startGeneration += 1
-        state = .starting
-        publicURL = nil
-        pendingFrontEndLaunch = true
-
-        // Arm the latch. Stop removes it again, which is what makes stopping
-        // fail-closed rather than merely killing a process.
         try? FileManager.default.createDirectory(atPath: Paths.dataDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: Paths.dataDir)
@@ -820,48 +791,28 @@ final class Controller: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(atPath: Paths.logDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
 
-        // The tunnel starts FIRST. cloudflared does not require its origin to be up,
-        // and knowing the hostname before launching the front end is what lets the
-        // OAuth issuer be pinned to the real public origin.
-        let tunnel = Process()
-        tunnel.executableURL = URL(fileURLWithPath: cf)
-        if let named = namedTunnel {
-            // Keep the current skill deployment behavior: the named tunnel points at
-            // this app-owned local front end, so no separate cloudflared config file is required.
-            tunnel.arguments = ["tunnel", "--no-autoupdate", "run", "--url", "http://127.0.0.1:\(httpPort)", named.name]
-        } else {
-            tunnel.arguments = ["tunnel", "--url", "http://127.0.0.1:\(httpPort)", "--no-autoupdate"]
-        }
-        tunnel.environment = childEnvironment(publicURL: nil)
-        let pipe = Pipe()
-        tunnel.standardOutput = pipe
-        tunnel.standardError = pipe
-        do { try tunnel.run() } catch {
-            stopBridge()
-            state = .failed("cloudflared: \(error.localizedDescription)")
-            return
-        }
-        tunnelProcess = tunnel
-        try? String(tunnel.processIdentifier).write(toFile: Paths.tunnelPidFile, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.tunnelPidFile)
-        readTunnelOutput(pipe)
-
-        if let named = namedTunnel {
-            // The hostname is already known, so the front end starts immediately with the
-            // issuer pinned. No output scraping, and no chance of sitting in "Starting…"
-            // because a quick tunnel never announced a URL.
-            publicURL = named.publicURL
-            launchFrontEnd(publicURL: named.publicURL)
-        } else {
-            // Quick tunnel: the hostname only exists in cloudflared's output. Fail loudly
-            // rather than waiting forever if it never appears.
-            let generation = startGeneration
-            DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
-                guard let self, self.startGeneration == generation, self.pendingFrontEndLaunch else { return }
-                self.stopBridge()
-                self.state = .failed("cloudflared produced no hostname in 45s — see Open Logs")
+        state = .starting
+        publicURL = namedTunnel?.publicURL
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [Paths.runtimeStartScript, "bridge-start"]
+        process.currentDirectoryURL = URL(fileURLWithPath: Paths.packageDir)
+        process.environment = childEnvironment(publicURL: publicURL)
+        process.standardOutput = appendHandle(Paths.runtimeStartLog)
+        process.standardError = appendHandle(Paths.runtimeStartLog)
+        process.terminationHandler = { [weak self] finished in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if finished.terminationStatus != 0 {
+                    try? FileManager.default.removeItem(atPath: Paths.unlockFile)
+                    self.state = .failed("PM2 bridge start failed (code \(finished.terminationStatus))")
+                }
                 self.render()
             }
+        }
+        do { try process.run() } catch {
+            try? FileManager.default.removeItem(atPath: Paths.unlockFile)
+            state = .failed("PM2 bridge start: \(error.localizedDescription)")
         }
     }
 
@@ -879,6 +830,10 @@ final class Controller: NSObject, NSApplicationDelegate {
             env["MAC_DEV_BRIDGE_OAUTH_REDIRECT_URIS"] = redirects
         }
         env["MAC_DEV_BRIDGE_MCP_SERVERS_FILE"] = Paths.dataDir + "/mcp-servers.json"
+        env["MAC_DEV_BRIDGE_PACKAGE_DIR"] = Paths.packageDir
+        if let nodePath { env["MAC_DEV_BRIDGE_NODE_BIN"] = nodePath }
+        if let cloudflaredPath { env["MAC_DEV_BRIDGE_CLOUDFLARED_BIN"] = cloudflaredPath }
+        if let namedTunnel { env["MAC_DEV_BRIDGE_TUNNEL_NAME"] = namedTunnel.name }
         if let publicURL { env["MAC_DEV_BRIDGE_PUBLIC_URL"] = publicURL }
         // Never inherit the env-var form of the acknowledgement. bridge.mjs treats it as
         // a standing unlock, so a bridge started with it set cannot be revoked by
@@ -891,26 +846,6 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     /// Launch the front end once the public origin is known.
-    private func launchFrontEnd(publicURL url: String) {
-        guard pendingFrontEndLaunch, let node = nodePath else { return }
-        pendingFrontEndLaunch = false
-
-        let http = Process()
-        http.executableURL = URL(fileURLWithPath: node)
-        http.arguments = [Paths.frontEnd]
-        http.environment = childEnvironment(publicURL: url)
-        http.standardOutput = appendHandle(Paths.logDir + "/http.stdout.log")
-        http.standardError = appendHandle(Paths.httpLog)
-        do { try http.run() } catch {
-            stopBridge()
-            state = .failed("front end: \(error.localizedDescription)")
-            render()
-            return
-        }
-        httpProcess = http
-        render()
-    }
-
     /// Signal a process group, refusing any target that is not a real pid.
     ///
     /// Foundation reports processIdentifier == 0 for a Process that never launched or
@@ -918,97 +853,22 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// group while `kill(-1, sig)` signals every process the user owns. The isRunning
     /// checks at the call sites should already prevent that; this makes it structural,
     /// because the downside is losing the user's session.
-    private static func signalGroup(_ process: Process, _ sig: Int32) -> Bool {
-        let pid = process.processIdentifier
-        guard pid > 1 else { return false }
-        if kill(-pid, sig) == 0 { return true }
-        return kill(pid, sig) == 0   // fall back to the single process
-    }
-
     private func stopBridge(blocking: Bool = false) {
-        // Disarm first, so anything mid-flight is refused even before the
-        // processes die.
         try? FileManager.default.removeItem(atPath: Paths.unlockFile)
-
-        let doomed = [tunnelProcess, httpProcess].compactMap { $0 }
-        // Captured before the refs are nil'd, so escalate deletes only its own record.
-        let ownedTunnelPid: Int32? = tunnelProcess.map { $0.processIdentifier }.flatMap { $0 > 1 ? $0 : nil }
-        for process in doomed where process.isRunning {
-            // Signal the process GROUP. Foundation gives each child its own group, and
-            // terminate() reaches only the direct child — so bridge.mjs's `zsh -lc`
-            // grandchildren (an in-flight shell_exec, for instance) kept running after
-            // Stop. Fall back to the single process if the group call fails.
-            if !Self.signalGroup(process, SIGTERM) {
-                process.terminate()
-            }
-        }
-
-        let escalate = {
-            let deadline = Date().addingTimeInterval(3)
-            for process in doomed {
-                while process.isRunning && Date() < deadline { usleep(50_000) }
-                if process.isRunning { _ = Self.signalGroup(process, SIGKILL) }
-            }
-            // Compare-and-delete, and only for the tunnel this closure owned.
-            //
-            // Three bugs lived here. `allSatisfy` on an EMPTY doomed array is vacuously
-            // true, so a Stop-then-Quit deleted the record of a still-draining tunnel.
-            // A concurrent Start meant this closure erased the record of the NEW tunnel.
-            // And `isRunning` is still true immediately after SIGKILL, so gating on it
-            // leaked a stale record every escalation. Confirm death with kill(pid, 0),
-            // and only remove the file if it still names the pid we just killed.
-            if let tunnelPid = ownedTunnelPid {
-                let deadline = Date().addingTimeInterval(1)
-                while kill(tunnelPid, 0) == 0 && Date() < deadline { usleep(50_000) }
-                if kill(tunnelPid, 0) != 0,
-                   let recorded = try? String(contentsOfFile: Paths.tunnelPidFile, encoding: .utf8),
-                   Int32(recorded.trimmingCharacters(in: .whitespacesAndNewlines)) == tunnelPid {
-                    try? FileManager.default.removeItem(atPath: Paths.tunnelPidFile)
-                }
-            }
-        }
-        if blocking {
-            escalate()
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async(execute: escalate)
-        }
-
-        tunnelReader?.readabilityHandler = nil
-        tunnelProcess = nil
-        httpProcess = nil
-        tunnelReader = nil
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [Paths.runtimeStartScript, "bridge-stop"]
+        process.currentDirectoryURL = URL(fileURLWithPath: Paths.packageDir)
+        process.environment = childEnvironment(publicURL: nil)
+        process.standardOutput = appendHandle(Paths.runtimeStartLog)
+        process.standardError = appendHandle(Paths.runtimeStartLog)
+        if (try? process.run()) != nil, blocking { process.waitUntilExit() }
         publicURL = nil
         if case .failed = state {} else { state = .stopped }
     }
 
     /// cloudflared prints the assigned hostname to stderr; there is no flag to
     /// ask for it, so it is scraped from the stream.
-    private func readTunnelOutput(_ pipe: Pipe) {
-        let handle = pipe.fileHandleForReading
-        tunnelReader = handle
-        handle.readabilityHandler = { [weak self] fh in
-            let data = fh.availableData
-            guard !data.isEmpty else {
-                fh.readabilityHandler = nil
-                return
-            }
-            let text = String(decoding: data, as: UTF8.self)
-            try? text.data(using: .utf8)?.append(toFile: Paths.tunnelLog)
-            guard let self else { return }
-            if let found = Self.firstTryCloudflareURL(in: text) {
-                DispatchQueue.main.async {
-                    if self.publicURL == nil {
-                        self.publicURL = found
-                        // The hostname is the trigger: the front end starts now, with the
-                        // issuer pinned to this origin.
-                        self.launchFrontEnd(publicURL: found)
-                        self.render()
-                    }
-                }
-            }
-        }
-    }
-
     /// True when `commandLine` is an interpreter RUNNING the named script: the script
     /// sits directly after the executable with only dash-flags between. Mere presence
     /// in argv is not enough — `node tests/http.mjs <path>/mcp-http.mjs` and
@@ -1077,34 +937,6 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// it as "code N" made a SIGTERMed process read as "code 0" — a clean shutdown.
     /// The two exit codes this stack actually produces are also translated, because
     /// "code 74" tells the user nothing.
-    static func describeExit(_ process: Process, name: String, isFrontEnd: Bool) -> String {
-        if process.terminationReason == .uncaughtSignal {
-            return "\(name) killed by signal \(process.terminationStatus)"
-        }
-        // 74 and 78 are mcp-http.mjs's own exit codes; they say nothing about
-        // cloudflared, so they are only translated for the front end. 78 comes solely
-        // from its token-file checks — the missing-unlock exit belongs to bridge.mjs,
-        // a grandchild the front end respawns rather than dying with.
-        if isFrontEnd {
-            switch process.terminationStatus {
-            case 74: return "front end could not listen — port \(httpPort) already in use"
-            case 78: return "front end rejected the token file — see Open Logs"
-            default: break
-            }
-        }
-        return "\(name) exited (code \(process.terminationStatus))"
-    }
-
-    static func firstTryCloudflareURL(in text: String) -> String? {
-        // Matches the quick-tunnel hostname cloudflared announces.
-        let pattern = "https://[a-z0-9-]+\\.trycloudflare\\.com"
-        guard let re = try? NSRegularExpression(pattern: pattern),
-              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-              let r = Range(m.range, in: text)
-        else { return nil }
-        return String(text[r])
-    }
-
     private func appendHandle(_ path: String) -> FileHandle {
         let fm = FileManager.default
         if !fm.fileExists(atPath: path) { fm.createFile(atPath: path, contents: nil) }
@@ -1116,49 +948,20 @@ final class Controller: NSObject, NSApplicationDelegate {
     // MARK: Status polling
 
     private func poll() {
-        // Status is measured, not assumed: a child can die without the app
-        // noticing, and cloudflared can be up while the front end is not.
-        // One child dying must take the whole deployment down. Reporting `.failed`
-        // while leaving the sibling running left cloudflared publishing a live public
-        // hostname with the unlock file still armed, and the menu saying "not
-        // running" — observed. stopBridge() runs first because it resets state.
-        if let http = httpProcess, !http.isRunning {
-            let why = Self.describeExit(http, name: "front end", isFrontEnd: true)
-            stopBridge()
-            state = .failed(why)
-            render()
-            return
+        if case .stopped = state { return }
+        if let raw = try? String(contentsOfFile: Paths.publicURLFile, encoding: .utf8) {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty { publicURL = value }
         }
-        if let tunnel = tunnelProcess, !tunnel.isRunning {
-            let why = Self.describeExit(tunnel, name: "cloudflared", isFrontEnd: false)
-            stopBridge()
-            state = .failed(why)
-            render()
-            return
-        }
-        guard httpProcess != nil else { return }
-
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(httpPort)/healthz")!)
         request.timeoutInterval = 1.5
         URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
             guard let self else { return }
             let ok = (response as? HTTPURLResponse)?.statusCode == 200
             DispatchQueue.main.async {
-                // Drop a response that outlived the deployment it described. Without
-                // this, a health check in flight when the user pressed Stop reassigned
-                // .starting afterwards, and poll()'s `guard httpProcess != nil` meant
-                // nothing ever corrected it: the menu read "Starting…" permanently
-                // while the bridge was stopped and disarmed.
-                guard self.httpProcess != nil else { return }
-                switch self.state {
-                case .failed: break
-                default:
-                    // Health is about the front end, not about having scraped a
-                    // URL. Gating "running" on URL detection left a named
-                    // cloudflared tunnel (which never prints a trycloudflare
-                    // hostname) stuck in "Starting…" while working correctly.
-                    self.state = ok ? .running : .starting
-                }
+                if case .stopped = self.state { return }
+                if case .failed = self.state { return }
+                self.state = ok ? .running : .starting
                 self.render()
             }
         }.resume()
