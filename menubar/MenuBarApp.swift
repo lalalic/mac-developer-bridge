@@ -125,8 +125,11 @@ struct DeploymentConfig {
     }()
 
     static func value(_ key: String) -> String? {
-        if let env = ProcessInfo.processInfo.environment[key], !env.isEmpty { return env }
+        // The deployment file is the persistent source of truth. A GUI app can inherit
+        // stale MAC_DEV_BRIDGE_* values from the shell/session that launched it; letting
+        // those override config.env can silently change the OAuth issuer after a restart.
         if let configured = values[key], !configured.isEmpty { return configured }
+        if let env = ProcessInfo.processInfo.environment[key], !env.isEmpty { return env }
         return nil
     }
 }
