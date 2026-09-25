@@ -5,12 +5,12 @@ set -euo pipefail
 #
 # Important naming rule:
 #   A federation provider key identifies ONE specific physical/logical node.
-#   If NODE_NAME=home98, its tools appear as home98__shell_exec,
-#   home98__fs_read, etc. In documentation, "xxxnode_*" means tools that are
+#   If NODE_NAME=home98_node, its tools appear as home98_node__shell_exec,
+#   home98_node__fs_read, etc. In documentation, "xxx_node__*" means tools that are
 #   specific to that one node; it does NOT mean a shared/global Mac tool.
 #
 # Required per-node config:
-#   NODE_NAME=home98
+#   NODE_NAME=home98_node
 #   HUB_SSH_TARGET=chengli@10.0.0.111
 #   HUB_MCP_PORT=28798
 #
@@ -128,7 +128,12 @@ install_launchd() {
 </dict></plist>
 PLIST
   launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
+  launchctl unload "$plist" 2>/dev/null || true
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    # macOS 11 can reject bootstrap into the GUI domain from an SSH session.
+    # Legacy load remains supported there and still installs this per-user agent.
+    launchctl load -w "$plist"
+  fi
 }
 
 case "${1:-start}" in

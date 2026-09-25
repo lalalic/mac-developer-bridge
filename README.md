@@ -761,12 +761,12 @@ Delete `~/Library/Application Support/MacDeveloperBridge` as well if you want th
 
 Remote Macs can join this bridge as named federation nodes using `scripts/mac-node-server.py` and `scripts/bootstrap-mac-node.sh`. Each node runs the same seven basic Mac tools locally and creates a reverse SSH tunnel back to a dedicated loopback port on the hub. The hub registers that port in `mcp-servers.json`.
 
-Naming is intentionally node-specific: a provider key names one physical/logical Mac. For example, provider `home98` produces tools such as `home98__shell_exec` and `home98__fs_read`. In bootstrap instructions, `xxxnode_*` means **tools for that specific node**, not shared/global Mac tools. Use stable logical names such as `work`, `home98`, or `build-mac`; do not encode transient IP addresses into tool behavior.
+Naming is intentionally node-specific: a provider key names one physical/logical Mac. For example, provider `home98_node` produces tools such as `home98_node__shell_exec` and `home98_node__fs_read`. In bootstrap instructions, `xxx_node__*` means **tools for that specific node**, not shared/global Mac tools. Use stable logical names such as `work_node`, `home98_node`, or `build_node`; do not encode transient IP addresses into tool behavior.
 
 Example per-node config:
 
 ```sh
-NODE_NAME=home98
+NODE_NAME=home98_node
 HUB_SSH_TARGET=chengli@10.0.0.111
 HUB_MCP_PORT=28798
 LOCAL_MCP_PORT=8789
