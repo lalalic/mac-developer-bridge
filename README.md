@@ -763,18 +763,23 @@ Remote Macs can join this bridge as named federation nodes using `scripts/mac-no
 
 Naming is intentionally node-specific: a provider key names one physical/logical Mac. For example, provider `home98_node` produces tools such as `home98_node__shell_exec` and `home98_node__fs_read`. In bootstrap instructions, `xxx_node__*` means **tools for that specific node**, not shared/global Mac tools. Use stable logical names such as `work_node`, `home98_node`, or `build_node`; do not encode transient IP addresses into tool behavior.
 
-Example per-node config:
+The canonical runtime contract is documented in [`docs/mac-node-runtime.md`](docs/mac-node-runtime.md). All nodes use the same server, configuration schema, SSH reverse tunnel, and `neo-node` CLI; only lifecycle mode differs.
+
+Example persistent-node config:
 
 ```sh
 NODE_NAME=home98_node
+NODE_MODE=persistent
 HUB_SSH_TARGET=chengli@10.0.0.111
 HUB_MCP_PORT=28798
 LOCAL_MCP_PORT=8789
 ```
 
-Install the persistent user LaunchAgent with:
+For a managed/corporate Mac, set `NODE_MODE=session`. In session mode `install` creates the user-space `neo-node` CLI but deliberately does not install a LaunchAgent. A user-owned always-on node may use `NODE_MODE=persistent`, where `install` also installs the per-user LaunchAgent.
 
 ```sh
 ~/.local/share/neo-node/bootstrap-mac-node.sh install
+~/.local/bin/neo-node doctor
+~/.local/bin/neo-node status
 ```
 
