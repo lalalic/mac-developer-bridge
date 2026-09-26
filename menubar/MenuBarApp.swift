@@ -838,6 +838,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         if let cloudflaredPath { env["MAC_DEV_BRIDGE_CLOUDFLARED_BIN"] = cloudflaredPath }
         if let namedTunnel { env["MAC_DEV_BRIDGE_TUNNEL_NAME"] = namedTunnel.name }
         if let publicURL { env["MAC_DEV_BRIDGE_PUBLIC_URL"] = publicURL }
+        // The default deployment must not inherit the test-only opt-in for legacy
+        // browser tools from the shell or parent app environment.
+        env.removeValue(forKey: "MAC_DEV_BRIDGE_ENABLE_LEGACY_BROWSER_TOOLS")
         // Never inherit the env-var form of the acknowledgement. bridge.mjs treats it as
         // a standing unlock, so a bridge started with it set cannot be revoked by
         // removing the unlock file — which would void this app's entire Stop contract.
