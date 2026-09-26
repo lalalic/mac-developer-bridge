@@ -15,6 +15,14 @@ fi
 ROOT="${MAC_DEV_BRIDGE_PACKAGE_DIR:-${0:A:h:h}}"
 CONFIG="$ROOT/scripts/mdb-pm2.config.cjs"
 SKILL_STATE="${ROOT:h}/.state"
+if [[ -f "$SKILL_STATE/config.env" ]]; then
+  # The deployment file is authoritative; do not let a stale PM2 daemon
+  # environment replace the configured OAuth issuer after a resurrection.
+  # shellcheck disable=SC1090
+  source "$SKILL_STATE/config.env"
+  export MAC_DEV_BRIDGE_HTTP_PORT MAC_DEV_BRIDGE_PUBLIC_URL MAC_DEV_BRIDGE_TUNNEL_NAME
+  export MAC_DEV_BRIDGE_OAUTH_REDIRECT_URIS
+fi
 if [[ -z "${MAC_DEV_BRIDGE_MCP_SERVERS_FILE:-}" && -f "$SKILL_STATE/mcp-servers.json" ]]; then
   export MAC_DEV_BRIDGE_MCP_SERVERS_FILE="$SKILL_STATE/mcp-servers.json"
 fi

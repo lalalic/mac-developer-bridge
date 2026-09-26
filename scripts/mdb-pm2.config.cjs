@@ -13,6 +13,7 @@ const tunnelArgs = tunnelName
 
 const inherited = { ...process.env };
 delete inherited.MAC_DEV_BRIDGE_FULL_ACCESS_ACK;
+delete inherited.MAC_DEV_BRIDGE_ENABLE_LEGACY_BROWSER_TOOLS;
 
 module.exports = {
   apps: [
