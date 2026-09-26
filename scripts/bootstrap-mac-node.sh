@@ -1,23 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
 
-# Generic Neo Mac node bootstrap.
-#
-# Important naming rule:
-#   A federation provider key identifies ONE specific physical/logical node.
-#   If NODE_NAME=home98_node, its tools appear as home98_node__shell_exec,
-#   home98_node__fs_read, etc. In documentation, "xxx_node__*" means tools that are
-#   specific to that one node; it does NOT mean a shared/global Mac tool.
-#
-# Required per-node config:
-#   NODE_NAME=home98_node
-#   HUB_SSH_TARGET=chengli@10.0.0.111
-#   HUB_MCP_PORT=28798
-#
-# Optional:
-#   LOCAL_MCP_PORT=8789
-#   NODE_ROOT=~/.local/share/neo-node
-
 CONFIG_FILE="${NEO_NODE_CONFIG:-$HOME/.config/neo-node/node.env}"
 [[ -f "$CONFIG_FILE" ]] || { print -u2 -- "missing config: $CONFIG_FILE"; exit 64; }
 set -a
@@ -28,6 +11,7 @@ set +a
 : "${HUB_SSH_TARGET:?HUB_SSH_TARGET is required}"
 : "${HUB_MCP_PORT:?HUB_MCP_PORT is required}"
 
+NODE_MODE="${NODE_MODE:-session}"
 LOCAL_MCP_PORT="${LOCAL_MCP_PORT:-8789}"
 NODE_ROOT="${NODE_ROOT:-$HOME/.local/share/neo-node}"
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
@@ -35,7 +19,26 @@ SSH_BIN="${SSH_BIN:-/usr/bin/ssh}"
 SERVER="$NODE_ROOT/mac-node-server.py"
 LOG_DIR="$NODE_ROOT/logs"
 PID_DIR="$NODE_ROOT/run"
+KEY_FILE="$HOME/.config/neo-node/id_ed25519"
+LAUNCH_LABEL="com.neo.mac-node.$NODE_NAME"
+LAUNCH_PLIST="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
+CLI_PATH="$HOME/.local/bin/neo-node"
+
+case "$NODE_MODE" in
+  session|persistent) ;;
+  *) print -u2 -- "invalid NODE_MODE=$NODE_MODE (expected session|persistent)"; exit 64 ;;
+esac
+
 mkdir -p "$LOG_DIR" "$PID_DIR"
+
+install_cli() {
+  mkdir -p "$HOME/.local/bin"
+  cat > "$CLI_PATH" <<EOF
+#!/bin/zsh
+exec /bin/zsh "$NODE_ROOT/bootstrap-mac-node.sh" "\$@"
+EOF
+  chmod 755 "$CLI_PATH"
+}
 
 start_server() {
   if [[ -f "$PID_DIR/server.pid" ]] && kill -0 "$(cat "$PID_DIR/server.pid")" 2>/dev/null; then
@@ -57,7 +60,7 @@ start_tunnel() {
     -o ServerAliveInterval=20 \
     -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=accept-new \
-    -i "$HOME/.config/neo-node/id_ed25519" \
+    -i "$KEY_FILE" \
     -R "127.0.0.1:$HUB_MCP_PORT:127.0.0.1:$LOCAL_MCP_PORT" \
     "$HUB_SSH_TARGET" >>"$LOG_DIR/tunnel.log" 2>&1 &
   echo $! > "$PID_DIR/tunnel.pid"
@@ -94,7 +97,7 @@ run_foreground() {
     -o ServerAliveInterval=20 \
     -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=accept-new \
-    -i "$HOME/.config/neo-node/id_ed25519" \
+    -i "$KEY_FILE" \
     -R "127.0.0.1:$HUB_MCP_PORT:127.0.0.1:$LOCAL_MCP_PORT" \
     "$HUB_SSH_TARGET" >>"$LOG_DIR/tunnel.log" 2>&1 &
   tunnel_pid=$!
@@ -107,14 +110,16 @@ run_foreground() {
 }
 
 install_launchd() {
-  local label="com.neo.mac-node.$NODE_NAME"
-  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  [[ "$NODE_MODE" == "persistent" ]] || {
+    print -- "NODE_MODE=$NODE_MODE: LaunchD installation skipped"
+    return 0
+  }
   mkdir -p "$HOME/Library/LaunchAgents"
-  cat > "$plist" <<PLIST
+  cat > "$LAUNCH_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>$label</string>
+  <key>Label</key><string>$LAUNCH_LABEL</string>
   <key>ProgramArguments</key><array>
     <string>/bin/zsh</string>
     <string>$NODE_ROOT/bootstrap-mac-node.sh</string>
@@ -127,17 +132,62 @@ install_launchd() {
   <key>StandardErrorPath</key><string>$LOG_DIR/launchd.err.log</string>
 </dict></plist>
 PLIST
-  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  launchctl unload "$plist" 2>/dev/null || true
-  if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
-    # macOS 11 can reject bootstrap into the GUI domain from an SSH session.
-    # Legacy load remains supported there and still installs this per-user agent.
-    launchctl load -w "$plist"
+  launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
+  launchctl unload "$LAUNCH_PLIST" 2>/dev/null || true
+  if ! launchctl bootstrap "gui/$(id -u)" "$LAUNCH_PLIST" 2>/dev/null; then
+    launchctl load -w "$LAUNCH_PLIST"
   fi
 }
 
-case "${1:-start}" in
-  install) install_launchd ;;
+uninstall_persistence() {
+  launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
+  launchctl unload "$LAUNCH_PLIST" 2>/dev/null || true
+  rm -f "$LAUNCH_PLIST"
+}
+
+status() {
+  print -- "node: $NODE_NAME"
+  print -- "mode: $NODE_MODE"
+  print -- "root: $NODE_ROOT"
+  if curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" 2>/dev/null; then :; else print -- "health: unavailable"; fi
+  print -- "server pid: $(cat "$PID_DIR/server.pid" 2>/dev/null || print missing)"
+  print -- "tunnel pid: $(cat "$PID_DIR/tunnel.pid" 2>/dev/null || print missing)"
+  if [[ -f "$LAUNCH_PLIST" ]]; then
+    print -- "launchd plist: present"
+  else
+    print -- "launchd plist: absent"
+  fi
+}
+
+doctor() {
+  local failed=0
+  print -- "neo-node doctor"
+  print -- "node=$NODE_NAME mode=$NODE_MODE"
+
+  for f in "$CONFIG_FILE" "$SERVER" "$KEY_FILE"; do
+    if [[ -e "$f" ]]; then print -- "ok file $f"; else print -- "missing $f"; failed=1; fi
+  done
+  for b in "$PYTHON_BIN" "$SSH_BIN" /usr/bin/curl; do
+    if [[ -x "$b" ]]; then print -- "ok executable $b"; else print -- "missing executable $b"; failed=1; fi
+  done
+
+  if [[ "$NODE_MODE" == "session" && -f "$LAUNCH_PLIST" ]]; then
+    print -- "warning: session node has legacy LaunchD plist: $LAUNCH_PLIST"
+  fi
+
+  if curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" >/dev/null 2>&1; then
+    print -- "ok local MCP health"
+  else
+    print -- "info local MCP is not currently reachable"
+  fi
+  return "$failed"
+}
+
+case "${1:-status}" in
+  install)
+    install_cli
+    install_launchd
+    ;;
   run) run_foreground ;;
   start)
     start_server
@@ -147,10 +197,8 @@ case "${1:-start}" in
     ;;
   stop) stop_all ;;
   restart) stop_all; sleep 0.5; start_server; sleep 0.5; start_tunnel ;;
-  status)
-    curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" || true
-    print -- "server pid: $(cat "$PID_DIR/server.pid" 2>/dev/null || print missing)"
-    print -- "tunnel pid: $(cat "$PID_DIR/tunnel.pid" 2>/dev/null || print missing)"
-    ;;
-  *) print -u2 -- "usage: $0 [install|run|start|stop|restart|status]"; exit 64 ;;
+  status) status ;;
+  doctor) doctor ;;
+  uninstall-persistence) uninstall_persistence ;;
+  *) print -u2 -- "usage: neo-node [install|run|start|stop|restart|status|doctor|uninstall-persistence]"; exit 64 ;;
 esac
