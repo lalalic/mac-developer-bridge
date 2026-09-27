@@ -28,6 +28,7 @@ For managed/corporate machines. No LaunchAgent is installed or required.
 - the reverse SSH tunnel is the only remote exposure
 - runtime can be started/stopped entirely from the user account
 - a legacy host launcher may invoke `neo-node run`, but contains no runtime logic
+- `neo-node start` launches a user-space supervisor that reconnects the reverse SSH tunnel after sleep/wake or network interruption with bounded backoff
 
 ### persistent
 
@@ -36,6 +37,7 @@ For user-owned always-on machines.
 - same server, configuration, CLI and tunnel contract
 - may use a per-user LaunchAgent as a lifecycle adapter
 - LaunchD is not part of the core runtime contract
+- the same supervisor owns the local MCP server and reverse SSH child processes; LaunchD only keeps that supervisor alive
 
 ## Configuration
 
@@ -65,6 +67,8 @@ neo-node uninstall-persistence
 ```
 
 `install` is mode-aware: session mode installs no persistence; persistent mode may install the per-user LaunchAgent.
+
+`status` reports local MCP health plus supervisor/server/tunnel PID liveness separately. Stale PID files are reported as stale and are never treated as proof that a process is healthy.
 
 ## Compatibility
 
