@@ -23,6 +23,10 @@ KEY_FILE="$HOME/.config/neo-node/id_ed25519"
 LAUNCH_LABEL="com.neo.mac-node.$NODE_NAME"
 LAUNCH_PLIST="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
 CLI_PATH="$HOME/.local/bin/neo-node"
+SUPERVISOR_PID_FILE="$PID_DIR/supervisor.pid"
+SERVER_PID_FILE="$PID_DIR/server.pid"
+TUNNEL_PID_FILE="$PID_DIR/tunnel.pid"
+RECONNECT_MAX_SECONDS="${NEO_NODE_RECONNECT_MAX_SECONDS:-30}"
 
 case "$NODE_MODE" in
   session|persistent) ;;
@@ -30,6 +34,67 @@ case "$NODE_MODE" in
 esac
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
+
+read_pid() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  local pid
+  pid="$(cat "$file" 2>/dev/null || true)"
+  [[ "$pid" == <-> ]] || return 1
+  print -- "$pid"
+}
+
+pid_alive() {
+  local pid
+  pid="$(read_pid "$1")" || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+pid_status() {
+  local label="$1" file="$2" pid
+  if pid="$(read_pid "$file")"; then
+    if kill -0 "$pid" 2>/dev/null; then
+      print -- "$label pid: $pid (alive)"
+    else
+      print -- "$label pid: $pid (stale)"
+    fi
+  else
+    print -- "$label pid: missing"
+  fi
+}
+
+local_mcp_healthy() {
+  curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" >/dev/null 2>&1
+}
+
+epoch_seconds() {
+  date +%s
+}
+
+discover_server_pid() {
+  local pid command
+  command -v pgrep >/dev/null 2>&1 || return 1
+  for pid in $(pgrep -f "$SERVER" 2>/dev/null || true); do
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command" == *"$SERVER"* ]] || continue
+    print -- "$pid"
+    return 0
+  done
+  return 1
+}
+
+reconcile_server_pid() {
+  local pid
+  if pid_alive "$SERVER_PID_FILE"; then
+    return 0
+  fi
+  if local_mcp_healthy && pid="$(discover_server_pid)"; then
+    print -- "$pid" > "$SERVER_PID_FILE"
+    return 0
+  fi
+  rm -f "$SERVER_PID_FILE"
+  return 1
+}
 
 install_cli() {
   mkdir -p "$HOME/.local/bin"
@@ -41,55 +106,19 @@ EOF
 }
 
 start_server() {
-  if [[ -f "$PID_DIR/server.pid" ]] && kill -0 "$(cat "$PID_DIR/server.pid")" 2>/dev/null; then
+  if reconcile_server_pid; then
     return 0
   fi
   MAC_NODE_NAME="$NODE_NAME" MAC_NODE_PORT="$LOCAL_MCP_PORT" MAC_NODE_HOST=127.0.0.1 \
-    nohup "$PYTHON_BIN" "$SERVER" >>"$LOG_DIR/server.log" 2>&1 &
-  echo $! > "$PID_DIR/server.pid"
+    "$PYTHON_BIN" "$SERVER" >>"$LOG_DIR/server.log" 2>&1 &
+  echo $! > "$SERVER_PID_FILE"
 }
 
 start_tunnel() {
-  if [[ -f "$PID_DIR/tunnel.pid" ]] && kill -0 "$(cat "$PID_DIR/tunnel.pid")" 2>/dev/null; then
+  if pid_alive "$TUNNEL_PID_FILE"; then
     return 0
   fi
-  nohup "$SSH_BIN" \
-    -N \
-    -o BatchMode=yes \
-    -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=20 \
-    -o ServerAliveCountMax=3 \
-    -o StrictHostKeyChecking=accept-new \
-    -i "$KEY_FILE" \
-    -R "127.0.0.1:$HUB_MCP_PORT:127.0.0.1:$LOCAL_MCP_PORT" \
-    "$HUB_SSH_TARGET" >>"$LOG_DIR/tunnel.log" 2>&1 &
-  echo $! > "$PID_DIR/tunnel.pid"
-}
-
-stop_all() {
-  for f in "$PID_DIR/tunnel.pid" "$PID_DIR/server.pid"; do
-    if [[ -f "$f" ]]; then
-      kill "$(cat "$f")" 2>/dev/null || true
-      rm -f "$f"
-    fi
-  done
-}
-
-run_foreground() {
-  local server_pid tunnel_pid
-  trap 'kill "$server_pid" "$tunnel_pid" 2>/dev/null || true' EXIT INT TERM
-
-  MAC_NODE_NAME="$NODE_NAME" MAC_NODE_PORT="$LOCAL_MCP_PORT" MAC_NODE_HOST=127.0.0.1 \
-    "$PYTHON_BIN" "$SERVER" >>"$LOG_DIR/server.log" 2>&1 &
-  server_pid=$!
-  echo "$server_pid" > "$PID_DIR/server.pid"
-
-  for _ in {1..20}; do
-    curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" >/dev/null 2>&1 && break
-    sleep 0.25
-  done
-  curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" >/dev/null
-
+  rm -f "$TUNNEL_PID_FILE"
   "$SSH_BIN" \
     -N \
     -o BatchMode=yes \
@@ -100,13 +129,113 @@ run_foreground() {
     -i "$KEY_FILE" \
     -R "127.0.0.1:$HUB_MCP_PORT:127.0.0.1:$LOCAL_MCP_PORT" \
     "$HUB_SSH_TARGET" >>"$LOG_DIR/tunnel.log" 2>&1 &
-  tunnel_pid=$!
-  echo "$tunnel_pid" > "$PID_DIR/tunnel.pid"
+  echo $! > "$TUNNEL_PID_FILE"
+}
 
-  while kill -0 "$server_pid" 2>/dev/null && kill -0 "$tunnel_pid" 2>/dev/null; do
+stop_all() {
+  local supervisor_pid="" tunnel_pid="" server_pid="" discovered_server=""
+  supervisor_pid="$(read_pid "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
+  tunnel_pid="$(read_pid "$TUNNEL_PID_FILE" 2>/dev/null || true)"
+  server_pid="$(read_pid "$SERVER_PID_FILE" 2>/dev/null || true)"
+
+  [[ -n "$supervisor_pid" ]] && kill "$supervisor_pid" 2>/dev/null || true
+  [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" 2>/dev/null || true
+  [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null || true
+
+  if discovered_server="$(discover_server_pid 2>/dev/null)" && [[ "$discovered_server" != "$$" ]]; then
+    kill "$discovered_server" 2>/dev/null || true
+  fi
+
+  rm -f "$SUPERVISOR_PID_FILE" "$TUNNEL_PID_FILE" "$SERVER_PID_FILE"
+}
+
+run_foreground() {
+  local server_pid="" tunnel_pid="" reconnect_delay=1 tunnel_started_at=0 now=0
+  local existing_supervisor=""
+
+  if existing_supervisor="$(read_pid "$SUPERVISOR_PID_FILE" 2>/dev/null)" \
+    && [[ "$existing_supervisor" != "$$" ]] \
+    && kill -0 "$existing_supervisor" 2>/dev/null; then
+    print -u2 -- "neo-node supervisor already running: $existing_supervisor"
+    return 0
+  fi
+
+  print -- "$$" > "$SUPERVISOR_PID_FILE"
+  trap '
+    [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" 2>/dev/null || true
+    [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null || true
+    rm -f "$SUPERVISOR_PID_FILE" "$TUNNEL_PID_FILE" "$SERVER_PID_FILE"
+  ' EXIT INT TERM
+
+  while true; do
+    if ! reconcile_server_pid; then
+      start_server
+    fi
+    server_pid="$(read_pid "$SERVER_PID_FILE")"
+
+    for _ in {1..20}; do
+      local_mcp_healthy && break
+      sleep 0.25
+    done
+    if ! local_mcp_healthy; then
+      print -u2 -- "local MCP failed to become healthy; retrying"
+      kill "$server_pid" 2>/dev/null || true
+      rm -f "$SERVER_PID_FILE"
+      server_pid=""
+      sleep "$reconnect_delay"
+      (( reconnect_delay = reconnect_delay < RECONNECT_MAX_SECONDS ? reconnect_delay * 2 : RECONNECT_MAX_SECONDS ))
+      continue
+    fi
+
+    if ! pid_alive "$TUNNEL_PID_FILE"; then
+      start_tunnel
+      tunnel_pid="$(read_pid "$TUNNEL_PID_FILE")"
+      tunnel_started_at="$(epoch_seconds)"
+    else
+      tunnel_pid="$(read_pid "$TUNNEL_PID_FILE")"
+      if (( tunnel_started_at == 0 )); then
+        tunnel_started_at="$(epoch_seconds)"
+      fi
+    fi
+
     sleep 5
+
+    if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+      rm -f "$TUNNEL_PID_FILE"
+      now="$(epoch_seconds)"
+      if (( now - tunnel_started_at >= 30 )); then
+        reconnect_delay=1
+      fi
+      print -u2 -- "reverse SSH tunnel exited; reconnecting in ${reconnect_delay}s"
+      sleep "$reconnect_delay"
+      (( reconnect_delay = reconnect_delay < RECONNECT_MAX_SECONDS ? reconnect_delay * 2 : RECONNECT_MAX_SECONDS ))
+      tunnel_pid=""
+      tunnel_started_at=0
+      continue
+    fi
+
+    now="$(epoch_seconds)"
+    if (( now - tunnel_started_at >= 30 )); then
+      reconnect_delay=1
+    fi
   done
-  return 1
+}
+
+start_supervisor() {
+  if pid_alive "$SUPERVISOR_PID_FILE"; then
+    return 0
+  fi
+  rm -f "$SUPERVISOR_PID_FILE"
+  nohup /bin/zsh "$NODE_ROOT/bootstrap-mac-node.sh" run >>"$LOG_DIR/supervisor.log" 2>&1 &
+  echo $! > "$SUPERVISOR_PID_FILE"
+
+  for _ in {1..40}; do
+    if local_mcp_healthy && pid_alive "$TUNNEL_PID_FILE"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  local_mcp_healthy && pid_alive "$TUNNEL_PID_FILE"
 }
 
 install_launchd() {
@@ -149,9 +278,14 @@ status() {
   print -- "node: $NODE_NAME"
   print -- "mode: $NODE_MODE"
   print -- "root: $NODE_ROOT"
-  if curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" 2>/dev/null; then :; else print -- "health: unavailable"; fi
-  print -- "server pid: $(cat "$PID_DIR/server.pid" 2>/dev/null || print missing)"
-  print -- "tunnel pid: $(cat "$PID_DIR/tunnel.pid" 2>/dev/null || print missing)"
+  if local_mcp_healthy; then
+    print -- "local MCP: healthy"
+  else
+    print -- "local MCP: unavailable"
+  fi
+  pid_status "supervisor" "$SUPERVISOR_PID_FILE"
+  pid_status "server" "$SERVER_PID_FILE"
+  pid_status "tunnel" "$TUNNEL_PID_FILE"
   if [[ -f "$LAUNCH_PLIST" ]]; then
     print -- "launchd plist: present"
   else
@@ -175,10 +309,20 @@ doctor() {
     print -- "warning: session node has legacy LaunchD plist: $LAUNCH_PLIST"
   fi
 
-  if curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" >/dev/null 2>&1; then
+  if local_mcp_healthy; then
     print -- "ok local MCP health"
   else
     print -- "info local MCP is not currently reachable"
+  fi
+  if pid_alive "$SUPERVISOR_PID_FILE"; then
+    print -- "ok supervisor process"
+  else
+    print -- "info supervisor process is not currently running"
+  fi
+  if pid_alive "$TUNNEL_PID_FILE"; then
+    print -- "ok reverse SSH tunnel process"
+  else
+    print -- "info reverse SSH tunnel process is not currently running"
   fi
   return "$failed"
 }
@@ -189,14 +333,17 @@ case "${1:-status}" in
     install_launchd
     ;;
   run) run_foreground ;;
-  start)
-    start_server
-    sleep 0.5
-    curl -fsS "http://127.0.0.1:$LOCAL_MCP_PORT/healthz" >/dev/null
-    start_tunnel
-    ;;
+  start) start_supervisor ;;
   stop) stop_all ;;
-  restart) stop_all; sleep 0.5; start_server; sleep 0.5; start_tunnel ;;
+  restart)
+    if [[ "$NODE_MODE" == "persistent" && -f "$LAUNCH_PLIST" ]]; then
+      launchctl kickstart -k "gui/$(id -u)/$LAUNCH_LABEL"
+    else
+      stop_all
+      sleep 0.5
+      start_supervisor
+    fi
+    ;;
   status) status ;;
   doctor) doctor ;;
   uninstall-persistence) uninstall_persistence ;;
